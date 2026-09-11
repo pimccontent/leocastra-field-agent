@@ -33,6 +33,27 @@ function setNav(page) {
   });
 }
 
+function notice(kind, text) {
+  const el = document.getElementById("notice");
+  if (!el) return;
+  if (!text) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  el.hidden = false;
+  el.innerHTML = `<div class="banner ${kind}">${esc(text)}</div>`;
+}
+
+function settingsNotice(kind, text) {
+  if (route() !== "settings") return;
+  notice(kind, text);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function api(path, options) {
   const r = await fetch(path, { cache: "no-store", ...options });
   const data = await r.json().catch(() => ({}));
@@ -40,184 +61,264 @@ async function api(path, options) {
   return data;
 }
 
+function setBusy(busy, extraIds) {
+  const ids = ["saveReconnect", "restartOnly", "wifiScan", "wifiConnect"].concat(extraIds || []);
+  ids.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = busy;
+  });
+}
+
 function renderStatus(s) {
   const bondKind = s.bond.active > 0 ? "ok" : s.metricsOk ? "wait" : "down";
-  const bondText = s.bond.active > 0
-    ? `${s.bond.active} of ${s.bond.configured} up`
-    : "Reconnecting to studio ingest";
+  const rtt = s.path && s.path.rttMs != null ? `${s.path.rttMs} ms` : "—";
+  const rttKind = s.path && s.path.rttMs != null ? "ok" : s.metricsOk ? "wait" : "down";
+  const buffer = s.path ? String(s.path.inFlight || 0) : "0";
+  const naks = s.path ? s.path.naks || 0 : 0;
+  const bitrate = s.encoder.bitrateKbps ? `${s.encoder.bitrateKbps} kbps` : "0 kbps";
+  const inputLabel = s.encoder.receiving ? (s.encoder.label || "Live") : "No Feed";
   return `
     <div class="grid">
       <div class="card">
-        ${label("Encoder", "Your encoder must publish SRT caller to this kit listen port. Programme appears here once packets arrive.")}
-        <div id="encoder" class="metric ${cls(s.encoder.receiving)}">${esc(s.encoder.label)}</div>
-        <div class="muted">${s.encoder.bitrateKbps ? s.encoder.bitrateKbps + " kbps" : "No programme yet"}</div>
+        ${label("Input", "SRT caller from your encoder to this kit. Live means packets are arriving.")}
+        <div class="metric ${cls(s.encoder.receiving ? "ok" : "wait")}">${esc(inputLabel)}</div>
+        <p class="hint">${esc(bitrate)}</p>
       </div>
       <div class="card">
-        ${label("Bond", "Paths from this kit to studio ingest. Down usually means the studio channel is not listening, or this kit cannot reach the ingest host on UDP.")}
-        <div class="metric ${cls(bondKind)}">${esc(bondText)}</div>
-        <div class="muted">${esc(s.bond.mode)} scheduler</div>
+        ${label("Bond", "Uplinks from this kit to studio ingest. Down usually means the channel is not listening, or UDP cannot reach the ingest host.")}
+        <div class="metric ${cls(bondKind)}">${esc(s.bond.label)}</div>
+        <p class="hint">${esc(s.bond.mode)} · ${s.windowMs || "—"} ms window</p>
       </div>
       <div class="card">
-        ${label("Listen", "Local SRT port for the encoder. On this box use 127.0.0.1; from another PC use this kit???s LAN IP.")}
-        <div class="metric">0.0.0.0:${esc(s.listenPort)}</div>
-        <div class="muted">SRT caller from the encoder</div>
+        ${label("RTT", "Worst round-trip among uplinks that are currently up. Updates from srtla_send.")}
+        <div class="metric ${cls(rttKind)}">${esc(rtt)}</div>
+        <p class="hint">${s.metricsOk ? "Worst live path" : "Sender offline"}</p>
       </div>
       <div class="card">
-        ${label("Studio ingest", "UDP host and bonded port from the studio contribution channel. This is not the HTTPS studio website unless that name is an A record to the ingest host.")}
-        <div class="metric" style="font-size:1rem">${esc(s.ingest || "Not set")}</div>
-        <div class="muted">UDP bonded ingest</div>
+        ${label("Buffer", "Packets currently in flight on the bond. NAKs are retransmit requests from ingest.")}
+        <div class="metric ${s.metricsOk ? "ok" : "down"}">${esc(buffer)}</div>
+        <p class="hint">${naks} NAK${naks === 1 ? "" : "s"}</p>
       </div>
     </div>
     <div class="section card">
       <h2>Uplinks</h2>
-      <table>
-        <thead><tr><th>Link</th><th>Bind</th><th>Kind</th><th>State</th><th>Bitrate</th><th>RTT</th><th>NAKs</th></tr></thead>
-        <tbody>
-          ${(s.links || []).map((l) => `
-            <tr>
-              <td>${esc(l.label)}</td>
-              <td><code>${esc(l.ip)}</code></td>
-              <td>${esc(l.kind || "???")}</td>
-              <td class="${l.up ? "ok" : "down"}">${l.up ? "Up" : "Down"}</td>
-              <td>${l.bitrateKbps} kbps</td>
-              <td>${l.rttMs} ms</td>
-              <td>${l.naks}</td>
-            </tr>`).join("") || `<tr><td colspan="7" class="muted">No uplinks</td></tr>`}
-        </tbody>
-      </table>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Link</th><th>Bind</th><th>Kind</th><th>State</th><th>Bitrate</th><th>RTT</th><th>NAKs</th></tr></thead>
+          <tbody>
+            ${(s.links || []).map((l) => `
+              <tr>
+                <td>${esc(l.label)}</td>
+                <td><code>${esc(l.ip)}</code></td>
+                <td>${esc(l.kind || "—")}</td>
+                <td class="${l.up ? "ok" : "down"}">${l.up ? "Up" : "Down"}</td>
+                <td>${l.bitrateKbps} kbps</td>
+                <td>${l.rttMs} ms</td>
+                <td>${l.naks}</td>
+              </tr>`).join("") || `<tr><td colspan="7" class="muted">No uplinks</td></tr>`}
+          </tbody>
+        </table>
+      </div>
     </div>
     <div class="section card">
       <h2>Networks</h2>
-      <table>
-        <thead><tr><th>Interface</th><th>Address</th><th>Kind</th><th>Bond</th></tr></thead>
-        <tbody>
-          ${(s.networks || []).map((n) => `
-            <tr>
-              <td>${esc(n.iface)}</td>
-              <td><code>${esc(n.address)}</code></td>
-              <td>${esc(n.kind)}</td>
-              <td>${n.bonded ? "Yes" : "No"}</td>
-            </tr>`).join("") || `<tr><td colspan="4" class="muted">No addresses</td></tr>`}
-        </tbody>
-      </table>
-      <p class="muted" style="margin:0.8rem 0 0">${s.metricsOk ? "Live ?? 2 s refresh" : "Bond metrics unavailable"}</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Interface</th><th>Address</th><th>Kind</th><th>Bond</th></tr></thead>
+          <tbody>
+            ${(s.networks || []).map((n) => `
+              <tr>
+                <td>${esc(n.iface)}</td>
+                <td><code>${esc(n.address)}</code></td>
+                <td>${esc(n.kind)}</td>
+                <td>${n.bonded ? "Yes" : "No"}</td>
+              </tr>`).join("") || `<tr><td colspan="4" class="muted">No addresses</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+      <p class="hint" style="margin-top:0.8rem">${s.metricsOk ? "Live · 2 s refresh" : "Bond metrics unavailable"}</p>
     </div>
   `;
 }
 
-function renderSettings(c, nets, message) {
+function renderSettings(c, nets) {
   const wifiIfaces = (nets || []).filter((n) => n.kind === "wifi");
   return `
-    ${message ? `<div class="banner ${message.ok ? "ok" : "err"}">${esc(message.text)}</div>` : ""}
-    <form id="settingsForm" class="card">
-      <h2>Studio ingest</h2>
-      <div class="field">
-        ${label("Ingest host", "Hostname or IP from the studio contribution channel. On Docker Desktop toward a local studio use host.docker.internal.")}
-        <input name="leocastraHost" value="${esc(c.leocastraHost)}" required/>
-      </div>
-      <div class="field">
-        ${label("Bonded port", "UDP port from the same studio endpoint.")}
-        <input name="bondedPort" type="number" min="1" max="65535" value="${esc(c.bondedPort)}" required/>
-      </div>
-      <div class="field">
-        ${label("Local SRT listen port", "Port the encoder calls. Must match the Field Agent URL shown in studio.")}
-        <input name="listenPort" type="number" min="1" max="65535" value="${esc(c.listenPort)}" required/>
-      </div>
-      <div class="field">
-        ${label("Studio URL", "Optional studio page shown as a shortcut on this kit. Not used for the bond.")}
-        <input name="studioUrl" value="${esc(c.studioUrl)}" placeholder="https://studio.example.com/???"/>
-      </div>
-      <div class="field">
-        ${label("Contribution window (ms)", "Match the studio contribution window. The Agent scales link timeout so a drop inside this budget can resume without a full handshake.")}
-        <input name="latencyMs" type="number" min="1500" max="8000" value="${esc(c.latencyMs)}" required/>
-      </div>
-      <div class="field">
-        ${label("Scheduler", "Enhanced scores links in real time. Classic round-robins. Use Enhanced unless a lab asks otherwise.")}
-        <select name="schedulerMode">
-          <option value="enhanced" ${c.schedulerMode === "enhanced" ? "selected" : ""}>Enhanced</option>
-          <option value="classic" ${c.schedulerMode === "classic" ? "selected" : ""}>Classic</option>
-        </select>
-      </div>
-      <div class="field">
-        ${label("Uplink mode", "Auto binds every global IPv4 (Ethernet, Wi-Fi, LTE). Manual pins specific source IPs.")}
-        <select name="uplinkMode" id="uplinkMode">
-          <option value="auto" ${c.uplinkMode === "auto" ? "selected" : ""}>Auto (all interfaces)</option>
-          <option value="manual" ${c.uplinkMode === "manual" ? "selected" : ""}>Manual IPs</option>
-        </select>
-      </div>
-      <div class="field" id="manualIps" style="${c.uplinkMode === "manual" ? "" : "display:none"}">
-        ${label("Source IPs", "One IPv4 per uplink, one per line. Mix independent radio cores. Wi-Fi is valid as a path.")}
-        <textarea name="uplinkIps" rows="4">${esc((c.uplinkIps || []).join("\n"))}</textarea>
-      </div>
-      <div class="actions">
-        <button class="primary" type="submit">Save and reconnect</button>
-        <button class="ghost" type="button" id="restartOnly">Reconnect now</button>
-      </div>
+    <form id="settingsForm" class="settings-grid">
+      <section class="card">
+        <h2>Studio ingest</h2>
+        <div class="field">
+          ${label("Ingest host", "Hostname or IP from the studio contribution channel. On Docker Desktop toward a local studio use host.docker.internal.")}
+          <input name="leocastraHost" value="${esc(c.leocastraHost)}" required autocomplete="off"/>
+        </div>
+        <div class="field">
+          ${label("Bonded port", "UDP port from the same studio endpoint.")}
+          <input name="bondedPort" type="number" min="1" max="65535" value="${esc(c.bondedPort)}" required/>
+        </div>
+        <div class="field">
+          ${label("Window (ms)", "Match the studio contribution window. The Agent scales link timeout so a drop inside this budget can resume.")}
+          <input name="latencyMs" type="number" min="1500" max="8000" value="${esc(c.latencyMs)}" required/>
+        </div>
+        <div class="field">
+          ${label("Studio URL", "Optional shortcut only. Not used for the bond.")}
+          <input name="studioUrl" value="${esc(c.studioUrl)}" placeholder="https://studio.example.com" autocomplete="off"/>
+        </div>
+      </section>
+      <section class="card">
+        <h2>This kit</h2>
+        <div class="field">
+          ${label("SRT listen port", "Port the encoder calls. On this box use 127.0.0.1; from another PC use the kit LAN IP.")}
+          <input name="listenPort" type="number" min="1" max="65535" value="${esc(c.listenPort)}" required/>
+        </div>
+        <div class="field">
+          ${label("Scheduler", "Enhanced scores links in real time. Use Enhanced unless a lab asks otherwise.")}
+          <select name="schedulerMode">
+            <option value="enhanced" ${c.schedulerMode === "enhanced" ? "selected" : ""}>Enhanced</option>
+            <option value="classic" ${c.schedulerMode === "classic" ? "selected" : ""}>Classic</option>
+          </select>
+        </div>
+        <div class="field">
+          ${label("Uplink mode", "Auto binds every global IPv4. Manual pins specific source IPs.")}
+          <select name="uplinkMode" id="uplinkMode">
+            <option value="auto" ${c.uplinkMode === "auto" ? "selected" : ""}>Auto (all interfaces)</option>
+            <option value="manual" ${c.uplinkMode === "manual" ? "selected" : ""}>Manual IPs</option>
+          </select>
+        </div>
+        <div class="field" id="manualIps" style="${c.uplinkMode === "manual" ? "" : "display:none"}">
+          ${label("Source IPs", "One IPv4 per uplink, one per line.")}
+          <textarea name="uplinkIps" rows="4">${esc((c.uplinkIps || []).join("\n"))}</textarea>
+        </div>
+      </section>
+      <section class="card">
+        <h2>Wi-Fi ${info("A bonded uplink on Linux kits with host networking. Docker Desktop shows one NAT path.")}</h2>
+        <div class="field">
+          ${label("Interface", "wlan0 or similar. Requires host networking on the mini server.")}
+          <select id="wifiIface">
+            ${wifiIfaces.length
+              ? wifiIfaces.map((n) => `<option value="${esc(n.iface)}">${esc(n.iface)} · ${esc(n.address)}</option>`).join("")
+              : `<option value="">No Wi-Fi interface visible</option>`}
+          </select>
+        </div>
+        <div class="field">
+          ${label("SSID", "Network name. Scan if this kit can see wireless radios.")}
+          <input id="wifiSsid" autocomplete="off"/>
+        </div>
+        <div class="field">
+          ${label("Password", "WPA passphrase. Used only for this connect attempt.")}
+          <input id="wifiPsk" type="password"/>
+        </div>
+        <div class="actions">
+          <button class="ghost" type="button" id="wifiScan">Scan</button>
+          <button class="primary" type="button" id="wifiConnect">Connect Wi-Fi</button>
+        </div>
+        <div id="wifiScanResult" class="scan-list"></div>
+      </section>
+      <section class="card apply-card">
+        <h2>Apply</h2>
+        <p class="apply-copy">Writes ingest and kit settings, then restarts the bond. Reconnect uses the last saved config.</p>
+        <div class="actions">
+          <button class="primary" type="submit" id="saveReconnect">Save and reconnect</button>
+          <button class="ghost" type="button" id="restartOnly">Reconnect now</button>
+        </div>
+      </section>
     </form>
-    <div class="section card">
-      <h2>Wi-Fi ${info("Wi-Fi is a normal bonded uplink on a Linux kit using host networking. Docker Desktop only shows one NAT path.")}</h2>
-      <div class="field">
-        ${label("Interface", "wlan0 or similar. Requires host networking on the mini server.")}
-        <select id="wifiIface">
-          ${wifiIfaces.length
-            ? wifiIfaces.map((n) => `<option value="${esc(n.iface)}">${esc(n.iface)} ?? ${esc(n.address)}</option>`).join("")
-            : `<option value="">No Wi-Fi interface visible</option>`}
-        </select>
-      </div>
-      <div class="field">
-        ${label("SSID", "Network name. Scan if this kit can see wireless radios.")}
-        <input id="wifiSsid"/>
-      </div>
-      <div class="field">
-        ${label("Password", "WPA passphrase. Stored only for the connect attempt on this kit.")}
-        <input id="wifiPsk" type="password"/>
-      </div>
-      <div class="actions">
-        <button class="ghost" type="button" id="wifiScan">Scan</button>
-        <button class="primary" type="button" id="wifiConnect">Connect Wi-Fi</button>
-      </div>
-      <div id="wifiScanResult" class="muted" style="margin-top:0.75rem"></div>
-    </div>
   `;
 }
 
 function renderHelp() {
   return `
-    <article class="help card">
-      <h2>Help</h2>
-      <h3>What this kit does</h3>
-      <p>LeoCastra Field Agent is a field contribution appliance. Your encoder sends SRT to this kit. The Agent bonds Ethernet, Wi-Fi, and cellular uplinks and forwards a single low-latency path to studio ingest. Studio pulls that programme as an SRT caller. The kit does not transcode video.</p>
-      <h3>Power-on</h3>
-      <p>The Agent starts with the mini server. You do not need a monitor. Docker kits use <code>restart: always</code> (enable Docker on boot with <code>install-kit.sh</code>). Bare-metal kits: <code>systemctl enable --now leocastra-field-agent</code>.</p>
-      <h3>First setup (no SSH after this)</h3>
+    <section class="help-hero card">
+      <h2>Field contribution kit</h2>
+      <p>Encoder sends SRT here. This kit bonds Ethernet, Wi-Fi, and cellular, then forwards one low-latency path to studio ingest. Studio pulls as an SRT caller. The kit does not transcode.</p>
+    </section>
+    <div class="help-grid">
+      <article class="help-card card">
+        <h3>Power-on</h3>
+        <p>Starts with the mini server. No monitor required. Docker kits restart with the host. Bare-metal kits enable the service on boot.</p>
+      </article>
+      <article class="help-card card">
+        <h3>Encoder</h3>
+        <p>Point any SRT encoder at this kit, usually port <code>4001</code>. Latency must match the contribution window. Do not send the encoder past this kit while it is in the path.</p>
+      </article>
+      <article class="help-card card">
+        <h3>Studio</h3>
+        <p>Start listening on the contribution channel. Ingest host is the UDP machine, not an HTTPS-only website. Pull is SRT caller.</p>
+      </article>
+    </div>
+    <section class="help-steps card">
+      <h2>First setup</h2>
       <ol>
-        <li>On a laptop or phone on the same LAN open <code>http://&lt;kit-ip&gt;:8088</code>.</li>
-        <li>Settings: enter ingest host and bonded port from the studio contribution channel.</li>
-        <li>Match the contribution window to studio (4000 ms is the usual start).</li>
-        <li>Save and reconnect. Start listening on the studio channel.</li>
-        <li>Encoder: SRT caller to this kit, port 4001 (or the listen port you set), same latency as the window.</li>
+        <li>On the same LAN open <code>http://&lt;kit-ip&gt;:8088</code>.</li>
+        <li>Settings: ingest host and bonded port from the studio channel.</li>
+        <li>Match the window to studio (4000 ms is the usual start).</li>
+        <li>Save and reconnect, then start listening on studio.</li>
+        <li>Point your SRT encoder at this kit. Confirm Input shows Live.</li>
       </ol>
-      <h3>Link A Down / 0 of 1 up</h3>
+    </section>
+    <section class="help-block card section">
+      <h3>Bond 0/1 or Link A Down</h3>
       <ol>
-        <li>The studio channel must be listening. After a studio restart, start listening again.</li>
-        <li>Ingest host must be the UDP ingest machine, not an HTTPS-only website proxy.</li>
-        <li>Use Reconnect now on Settings. The kit also reconnects on its own if every uplink stays down.</li>
-        <li>Two-path bonding needs a Linux kit with host networking. Docker Desktop shows one NAT path.</li>
+        <li>Studio channel must be listening. After a studio restart, start listening again.</li>
+        <li>Ingest host must accept UDP. Cloudflare HTTP proxy cannot carry SRTLA.</li>
+        <li>Use Reconnect now. The kit also reconnects if every uplink stays down.</li>
+        <li>Two-path bonding needs a Linux kit with host networking. Docker Desktop is one NAT path.</li>
       </ol>
-      <h3>Wi-Fi</h3>
-      <p>On Ubuntu Server with host networking, <code>wlan0</code> is an uplink the same way Ethernet or LTE is. Auto mode includes it when it has an IPv4 address. Connect SSID from Settings, then Save if you pin IPs manually.</p>
-      <h3>Smooth contribution</h3>
-      <ul>
-        <li>Encoder latency must match the studio window.</li>
-        <li>Two SIMs must be different radio cores.</li>
-        <li>Studio pull is SRT caller.</li>
-        <li>Leave the Agent running. Do not send the encoder past this kit to studio while the Agent is in the path.</li>
-      </ul>
-    </article>
+    </section>
+    <section class="help-block card section">
+      <h3>Wi-Fi and bonding</h3>
+      <p class="muted">On Ubuntu Server with host networking, <code>wlan0</code> is an uplink the same way Ethernet or LTE is. Auto mode includes it when it has an IPv4 address. Connect SSID from Settings, then Save if you pin IPs manually. Two SIMs must be different radio cores.</p>
+    </section>
   `;
 }
 
-let statusTimer = 0;
+function readSettingsBody(form) {
+  const host = form.leocastraHost.value.trim();
+  const bondedPort = Number(form.bondedPort.value);
+  const listenPort = Number(form.listenPort.value);
+  const latencyMs = Number(form.latencyMs.value);
+  if (!host) throw new Error("Ingest host is required");
+  if (!Number.isInteger(bondedPort) || bondedPort < 1 || bondedPort > 65535) {
+    throw new Error("Bonded port must be 1–65535");
+  }
+  if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
+    throw new Error("Listen port must be 1–65535");
+  }
+  if (!Number.isInteger(latencyMs) || latencyMs < 1500 || latencyMs > 8000) {
+    throw new Error("Contribution window must be 1500–8000 ms");
+  }
+  if (form.uplinkMode.value === "manual") {
+    const ips = form.uplinkIps.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    if (!ips.length) throw new Error("Manual mode needs at least one source IP");
+  }
+  return {
+    leocastraHost: host,
+    bondedPort,
+    listenPort,
+    studioUrl: form.studioUrl.value.trim(),
+    latencyMs,
+    schedulerMode: form.schedulerMode.value,
+    uplinkMode: form.uplinkMode.value,
+    uplinkIps: form.uplinkIps.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
+  };
+}
+
+async function waitForBond(ms, saved) {
+  const prefix = saved ? "Saved. " : "";
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    await sleep(1500);
+    try {
+      const s = await api("/api/status");
+      if (s.bond && s.bond.active > 0) {
+        settingsNotice("ok", `${prefix}Bond up (${s.bond.active}/${s.bond.configured}).`);
+        return;
+      }
+    } catch {
+      /* keep waiting */
+    }
+  }
+  settingsNotice("wait", `${prefix}Bond still down. Start listening on the studio channel, then Reconnect.`);
+}
 
 function bindSettings() {
   const mode = document.getElementById("uplinkMode");
@@ -229,92 +330,134 @@ function bindSettings() {
   }
   document.getElementById("settingsForm").addEventListener("submit", async (ev) => {
     ev.preventDefault();
-    const form = ev.target;
-    const body = {
-      leocastraHost: form.leocastraHost.value.trim(),
-      bondedPort: Number(form.bondedPort.value),
-      listenPort: Number(form.listenPort.value),
-      studioUrl: form.studioUrl.value.trim(),
-      latencyMs: Number(form.latencyMs.value),
-      schedulerMode: form.schedulerMode.value,
-      uplinkMode: form.uplinkMode.value,
-      uplinkIps: form.uplinkIps.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
-    };
+    let body;
+    try {
+      body = readSettingsBody(ev.target);
+    } catch (err) {
+      settingsNotice("err", err.message);
+      return;
+    }
+    setBusy(true);
+    settingsNotice("wait", "Saving settings…");
     try {
       await api("/api/config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      await api("/api/restart", { method: "POST" });
-      await showSettings({ ok: true, text: "Saved. Bond is reconnecting." });
     } catch (err) {
-      await showSettings({ ok: false, text: err.message });
+      settingsNotice("err", `Save failed: ${err.message}`);
+      setBusy(false);
+      return;
     }
-  });
-  document.getElementById("restartOnly").addEventListener("click", async () => {
     try {
       await api("/api/restart", { method: "POST" });
-      await showSettings({ ok: true, text: "Reconnect requested." });
     } catch (err) {
-      await showSettings({ ok: false, text: err.message });
+      settingsNotice("err", `Saved, but reconnect failed: ${err.message}`);
+      setBusy(false);
+      return;
     }
+    settingsNotice("wait", "Saved. Reconnecting bond…");
+    await waitForBond(8000, true);
+    setBusy(false);
+  });
+  document.getElementById("restartOnly").addEventListener("click", async () => {
+    setBusy(true);
+    settingsNotice("wait", "Reconnect requested…");
+    try {
+      await api("/api/restart", { method: "POST" });
+    } catch (err) {
+      settingsNotice("err", `Reconnect failed: ${err.message}`);
+      setBusy(false);
+      return;
+    }
+    await waitForBond(8000, false);
+    setBusy(false);
   });
   document.getElementById("wifiScan").addEventListener("click", async () => {
     const iface = document.getElementById("wifiIface").value;
     const box = document.getElementById("wifiScanResult");
+    setBusy(true);
+    settingsNotice("wait", "Scanning Wi-Fi…");
     try {
       const data = await api("/api/wifi/scan?iface=" + encodeURIComponent(iface || ""));
-      box.innerHTML = (data.ssids || []).length
-        ? data.ssids.map((x) => `<div><button class="ghost" type="button" data-ssid="${esc(x.ssid)}">${esc(x.ssid)}</button> ${esc(x.signal || "")}</div>`).join("")
-        : esc(data.error || "No networks found");
-      box.querySelectorAll("[data-ssid]").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          document.getElementById("wifiSsid").value = btn.getAttribute("data-ssid");
+      const ssids = data.ssids || [];
+      if (!ssids.length) {
+        box.innerHTML = `<span class="muted">${esc(data.error || "No networks found")}</span>`;
+        settingsNotice("wait", data.error || "No Wi-Fi networks found.");
+      } else {
+        box.innerHTML = ssids
+          .map((x) => `<button class="ghost" type="button" data-ssid="${esc(x.ssid)}">${esc(x.ssid)}${x.signal ? " · " + esc(x.signal) : ""}</button>`)
+          .join("");
+        box.querySelectorAll("[data-ssid]").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            document.getElementById("wifiSsid").value = btn.getAttribute("data-ssid");
+          });
         });
-      });
+        settingsNotice("ok", `Found ${ssids.length} network${ssids.length === 1 ? "" : "s"}.`);
+      }
     } catch (err) {
-      box.textContent = err.message;
+      box.innerHTML = `<span class="muted">${esc(err.message)}</span>`;
+      settingsNotice("err", `Scan failed: ${err.message}`);
     }
+    setBusy(false);
   });
   document.getElementById("wifiConnect").addEventListener("click", async () => {
+    const ssid = document.getElementById("wifiSsid").value.trim();
+    if (!ssid) {
+      settingsNotice("err", "SSID is required.");
+      return;
+    }
+    setBusy(true);
+    settingsNotice("wait", `Connecting to ${ssid}…`);
     try {
       await api("/api/wifi/connect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           iface: document.getElementById("wifiIface").value,
-          ssid: document.getElementById("wifiSsid").value,
+          ssid,
           psk: document.getElementById("wifiPsk").value,
         }),
       });
-      await showSettings({ ok: true, text: "Wi-Fi connect requested. Confirm the interface has an address, then Save if you use manual IPs." });
+      settingsNotice("ok", `Wi-Fi connect requested for ${ssid}. Confirm the interface has an address, then Save if you use manual IPs.`);
     } catch (err) {
-      await showSettings({ ok: false, text: err.message });
+      settingsNotice("err", `Wi-Fi connect failed: ${err.message}`);
     }
+    setBusy(false);
   });
 }
 
-async function showSettings(message) {
+async function showSettings() {
   const [c, s] = await Promise.all([api("/api/config"), api("/api/status")]);
-  document.getElementById("app").innerHTML = renderSettings(c, s.networks, message);
+  if (route() !== "settings") return;
+  applyHeader(s);
+  document.getElementById("app").innerHTML = renderSettings(c, s.networks);
   bindSettings();
+}
+
+function applyHeader(s) {
+  const pill = document.getElementById("bondPill");
+  if (!pill) return;
+  const up = s.bond.active > 0;
+  pill.className = "pill " + (up ? "ok" : s.metricsOk ? "wait" : "down");
+  document.getElementById("bondPillText").textContent = up ? "BOND UP" : "BOND DOWN";
 }
 
 async function tickStatus() {
   if (route() !== "status") return;
   const s = await api("/api/status");
-  document.getElementById("kitHost").textContent = s.hostname || "Contribution kit";
-  const pill = document.getElementById("bondPill");
-  const up = s.bond.active > 0;
-  pill.className = "pill " + (up ? "ok" : s.metricsOk ? "wait" : "down");
-  document.getElementById("bondPillText").textContent = up ? "BOND UP" : "BOND DOWN";
+  if (route() !== "status") return;
+  applyHeader(s);
   document.getElementById("app").innerHTML = renderStatus(s);
 }
+
+let statusTimer = 0;
 
 async function draw() {
   const page = route();
   setNav(page);
+  if (page !== "settings") notice("", "");
   if (statusTimer) {
     clearInterval(statusTimer);
     statusTimer = 0;
@@ -333,5 +476,6 @@ async function draw() {
 
 window.addEventListener("hashchange", () => draw().catch(console.error));
 draw().catch((err) => {
-  document.getElementById("app").innerHTML = `<div class="banner err">${esc(err.message)}</div>`;
+  notice("err", err.message);
+  document.getElementById("app").innerHTML = "";
 });

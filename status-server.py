@@ -108,11 +108,11 @@ def save_config(cfg: dict) -> dict:
     if not cleaned["leocastraHost"]:
         raise ValueError("Ingest host is required")
     if not 1 <= cleaned["bondedPort"] <= 65535:
-        raise ValueError("Bonded port must be 1???65535")
+        raise ValueError("Bonded port must be 1–65535")
     if not 1 <= cleaned["listenPort"] <= 65535:
-        raise ValueError("Listen port must be 1???65535")
+        raise ValueError("Listen port must be 1–65535")
     if not 1500 <= cleaned["latencyMs"] <= 8000:
-        raise ValueError("Contribution window must be 1500???8000 ms")
+        raise ValueError("Contribution window must be 1500–8000 ms")
     CONFIG_PATH.write_text(json.dumps(cleaned, indent=2) + "\n", encoding="utf-8")
     if cleaned["uplinkMode"] == "auto":
         UPLINKS_PATH.write_text("AUTO\n", encoding="utf-8")
@@ -125,7 +125,10 @@ def save_config(cfg: dict) -> dict:
 
 def request_restart() -> None:
     ensure_dirs()
-    RESTART_FLAG.write_text(str(time.time()), encoding="utf-8")
+    try:
+        RESTART_FLAG.write_text(str(time.time()), encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"Could not request reconnect: {exc}") from exc
 
 
 def iface_kind(name: str) -> str:
@@ -269,26 +272,41 @@ def snapshot() -> dict:
     total_bitrate = sum(link["bitrateKbps"] for link in links)
     active = int(gauge(metrics, "srtla_send_active_links"))
     total_links = int(gauge(metrics, "srtla_send_total_links", max(len(links), 1)))
-    encoder_receiving = total_bitrate > 8 or int(gauge(metrics, "srtla_send_total_in_flight")) > 0
+    in_flight = int(gauge(metrics, "srtla_send_total_in_flight")) or sum(
+        int(link.get("inFlight") or 0) for link in links
+    )
+    encoder_receiving = total_bitrate > 8 or in_flight > 0
     ingest = (
         f"{cfg['leocastraHost']}:{cfg['bondedPort']}" if cfg.get("leocastraHost") else ""
     )
+    up_links = [link for link in links if link.get("up")]
+    rtt_values = [int(link.get("rttMs") or 0) for link in up_links]
+    naks_total = sum(int(link.get("naks") or 0) for link in links)
+    lan_ip = next((n.get("address") or "" for n in networks if n.get("address")), "")
+    mode = "enhanced" if int(gauge(metrics, "srtla_send_mode", 1)) == 1 else "classic"
     return {
         "listenPort": str(cfg.get("listenPort") or ""),
         "ingest": ingest,
         "studioUrl": cfg.get("studioUrl") or "",
         "hostname": socket.gethostname(),
+        "lanIp": lan_ip,
+        "windowMs": int(cfg.get("latencyMs") or 4000),
         "metricsOk": bool(metrics),
         "encoder": {
             "receiving": encoder_receiving,
             "bitrateKbps": total_bitrate,
-            "label": "Receiving programme" if encoder_receiving else "Waiting for encoder",
+            "label": "Live" if encoder_receiving else "No Feed",
         },
         "bond": {
             "active": active,
             "configured": total_links,
-            "mode": "enhanced" if int(gauge(metrics, "srtla_send_mode", 1)) == 1 else "classic",
-            "label": f"{active} of {total_links} uplinks up",
+            "mode": mode,
+            "label": f"{active}/{total_links}",
+        },
+        "path": {
+            "rttMs": max(rtt_values) if rtt_values else None,
+            "inFlight": in_flight,
+            "naks": naks_total,
         },
         "links": links,
         "networks": networks,
@@ -430,8 +448,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/restart":
-            request_restart()
-            self._json(200, {"ok": True})
+            try:
+                request_restart()
+                self._json(200, {"ok": True})
+            except ValueError as exc:
+                self._json(500, {"error": str(exc)})
             return
         if parsed.path == "/api/wifi/connect":
             try:
@@ -466,7 +487,10 @@ def watchdog_loop() -> None:
             down_since = now
             continue
         if now - down_since >= 20 and now - last_restart >= 20:
-            request_restart()
+            try:
+                request_restart()
+            except ValueError:
+                pass
             last_restart = now
             down_since = now
 
