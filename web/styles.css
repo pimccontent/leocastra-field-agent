@@ -1,0 +1,253 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0d10;
+  --bg-raised: #12151a;
+  --bg-card: #161a21;
+  --line: #2a3140;
+  --text: #e8edf4;
+  --muted: #8b95a8;
+  --accent: #d4a017;
+  --ok: #3ecf8e;
+  --wait: #e0b04a;
+  --down: #e06b6b;
+  --focus: #7eb6ff;
+  --header: #0f1217;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  font-family: "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+a { color: var(--focus); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.85em;
+  background: #0c0e12;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1.25rem;
+  background: var(--header);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  min-width: 0;
+}
+.mark {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background: linear-gradient(160deg, #c99210, #7a5a08);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+.brand h1 {
+  margin: 0;
+  font-size: 1.02rem;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+.brand .sub {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+.nav {
+  display: flex;
+  gap: 0.35rem;
+}
+.nav a, .nav button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 0.45rem 0.75rem;
+  border-radius: 6px;
+  font: inherit;
+  cursor: pointer;
+}
+.nav a.active, .nav button.active, .nav a:hover, .nav button:hover {
+  color: var(--text);
+  background: #1c222c;
+  text-decoration: none;
+}
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 0.28rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+.pill.down { color: var(--down); border-color: color-mix(in srgb, var(--down) 45%, var(--line)); }
+.pill.wait { color: var(--wait); border-color: color-mix(in srgb, var(--wait) 45%, var(--line)); }
+.dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+main { max-width: 72rem; margin: 0 auto; padding: 1.25rem 1.15rem 3.5rem; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.75rem;
+}
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.95rem 1rem;
+}
+.card h2, .section h2 {
+  margin: 0 0 0.75rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.card h2 .info {
+  text-transform: none;
+  letter-spacing: 0;
+}
+.metric { font-size: 1.2rem; font-weight: 650; margin-top: 0.25rem; }
+.ok { color: var(--ok); }
+.wait { color: var(--wait); }
+.down { color: var(--down); }
+.muted { color: var(--muted); }
+
+.section { margin-top: 1.35rem; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 0.5rem 0.4rem; border-bottom: 1px solid var(--line); font-size: 0.92rem; }
+th {
+  color: var(--muted);
+  font-weight: 550;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.label-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0 0 0.35rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.info {
+  position: relative;
+  display: inline-flex;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  border: 1px solid var(--muted);
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+}
+.info:hover, .info:focus { color: var(--text); border-color: var(--text); }
+.info .tip {
+  display: none;
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+  width: min(20rem, 70vw);
+  background: #0e1218;
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.4;
+  padding: 0.55rem 0.65rem;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  z-index: 30;
+}
+.info:hover .tip, .info:focus .tip { display: block; }
+
+form .field { margin-bottom: 0.9rem; }
+input, select, textarea {
+  width: 100%;
+  background: #0c0e12;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0.55rem 0.65rem;
+  font: inherit;
+}
+input:focus, select:focus, textarea:focus {
+  outline: 2px solid color-mix(in srgb, var(--focus) 55%, transparent);
+  border-color: var(--focus);
+}
+.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem; }
+button.primary, button.ghost {
+  appearance: none;
+  border-radius: 7px;
+  padding: 0.55rem 0.9rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button.primary {
+  background: var(--accent);
+  color: #1a1303;
+  border: 0;
+}
+button.ghost {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.banner {
+  padding: 0.65rem 0.8rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+  border: 1px solid var(--line);
+}
+.banner.err { color: var(--down); border-color: color-mix(in srgb, var(--down) 40%, var(--line)); }
+.banner.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+
+.help h3 { font-size: 1rem; margin: 1.4rem 0 0.4rem; }
+.help p, .help li { color: var(--muted); font-size: 0.92rem; line-height: 1.5; }
+.help ol, .help ul { padding-left: 1.2rem; }
+
+@media (max-width: 720px) {
+  .top { flex-wrap: wrap; }
+  .nav { width: 100%; }
+}

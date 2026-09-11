@@ -1,0 +1,3 @@
+# Runtime kit state (Settings, resolved uplinks, pid). Keep out of git.
+*
+!.gitignore

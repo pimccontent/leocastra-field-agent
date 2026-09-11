@@ -1,0 +1,6 @@
+.env
+data
+.git
+*.md
+*.log
+*.pid

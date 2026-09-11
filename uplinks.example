@@ -1,0 +1,4 @@
+# One source IPv4 per uplink, one per line.
+# Use the address on each interface (`ip -4 addr`). Mix independent paths.
+192.168.8.100
+192.168.9.100

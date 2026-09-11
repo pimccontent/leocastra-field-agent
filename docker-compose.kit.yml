@@ -1,0 +1,8 @@
+# Linux mini-server overlay: host network so Wi-Fi / LTE IPs are bindable.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.kit.yml up -d
+services:
+  leocastra-field-agent:
+    network_mode: host
+    ports: !reset []
+    cap_add:
+      - NET_ADMIN

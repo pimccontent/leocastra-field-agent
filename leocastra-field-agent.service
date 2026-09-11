@@ -1,0 +1,19 @@
+[Unit]
+Description=LeoCastra Field Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CONFIG_DIR=/var/lib/leocastra
+Environment=UPLINKS_FILE=/var/lib/leocastra/uplinks
+Environment=STATUS_SERVER=/usr/local/lib/leocastra-field-agent-status.py
+Environment=WEB_ROOT=/usr/local/share/leocastra-field-agent/web
+Environment=SRTLA_SEND_BIN=/usr/local/bin/srtla_send
+EnvironmentFile=-/etc/leocastra/field-agent.env
+ExecStart=/usr/local/bin/leocastra-field-agent.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

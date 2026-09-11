@@ -1,0 +1,16 @@
+# Standalone Field Agent kit. Linux: compose with docker-compose.kit.yml (host network).
+# Lab on Docker Desktop: published ports; ingest host host.docker.internal when studio is local.
+services:
+  leocastra-field-agent:
+    build: .
+    image: leocastra-field-agent
+    container_name: leocastra-field-agent
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${SRT_LISTEN_PORT:-4001}:${SRT_LISTEN_PORT:-4001}/udp"
+      - "${STATUS_PORT:-8088}:${STATUS_PORT:-8088}"
+    volumes:
+      - ./data:/var/lib/leocastra
+    restart: always
