@@ -20,6 +20,31 @@ function esc(value) {
     .replace(/'/g, "&#39;");
 }
 
+function isNoiseIface(name) {
+  const iface = String(name || "").toLowerCase();
+  return (
+    iface === "lo" ||
+    iface.startsWith("docker") ||
+    iface.startsWith("br-") ||
+    iface.startsWith("veth") ||
+    iface.startsWith("cni") ||
+    iface.startsWith("flannel") ||
+    iface.startsWith("virbr")
+  );
+}
+
+function isDockerBridgeIp(ip) {
+  return /^172\.17\./.test(String(ip || ""));
+}
+
+function visibleNetworks(list) {
+  return (list || []).filter((n) => !isNoiseIface(n.iface) && !isDockerBridgeIp(n.address));
+}
+
+function visibleLinks(list) {
+  return (list || []).filter((l) => !isDockerBridgeIp(l.ip) && !isNoiseIface(l.iface));
+}
+
 function route() {
   const hash = (location.hash || "#/").replace(/^#/, "");
   if (hash.startsWith("/settings")) return "settings";
@@ -85,7 +110,7 @@ function renderStatus(s) {
         <p class="hint">${esc(bitrate)}</p>
       </div>
       <div class="card">
-        ${label("Bond", "Uplinks from this kit to studio ingest. Down usually means the channel is not listening, or UDP cannot reach the ingest host.")}
+        ${label("Bond", "Uplinks from this kit to studio ingest. Ping/ICMP can work while this stays Down: SRTLA is UDP to the bonded port. Studio must be listening. Waiting means the sender is restarting.")}
         <div class="metric ${cls(bondKind)}">${esc(s.bond.label)}</div>
         <p class="hint">${esc(s.bond.mode)} · ${s.windowMs || "—"} ms window</p>
       </div>
@@ -106,12 +131,12 @@ function renderStatus(s) {
         <table>
           <thead><tr><th>Link</th><th>Bind</th><th>Kind</th><th>State</th><th>Bitrate</th><th>RTT</th><th>NAKs</th></tr></thead>
           <tbody>
-            ${(s.links || []).map((l) => `
+            ${(visibleLinks(s.links).map((l) => `
               <tr>
                 <td>${esc(l.label)}</td>
                 <td><code>${esc(l.ip)}</code></td>
                 <td>${esc(l.kind || "—")}</td>
-                <td class="${l.up ? "ok" : "down"}">${l.up ? "Up" : "Down"}</td>
+                <td class="${l.up ? "ok" : (s.metricsOk ? "down" : "wait")}">${esc(l.up ? "Up" : (s.metricsOk ? "Down" : "Waiting"))}</td>
                 <td>${l.bitrateKbps} kbps</td>
                 <td>${l.rttMs} ms</td>
                 <td>${l.naks}</td>
@@ -126,7 +151,7 @@ function renderStatus(s) {
         <table>
           <thead><tr><th>Interface</th><th>Address</th><th>Kind</th><th>Bond</th></tr></thead>
           <tbody>
-            ${(s.networks || []).map((n) => `
+            ${(visibleNetworks(s.networks).map((n) => `
               <tr>
                 <td>${esc(n.iface)}</td>
                 <td><code>${esc(n.address)}</code></td>
@@ -138,7 +163,21 @@ function renderStatus(s) {
       </div>
       <p class="hint" style="margin-top:0.8rem">${s.metricsOk ? "Live · 2 s refresh" : "Bond metrics unavailable"}</p>
     </div>
+    <div class="section card">
+      <h2>Encoder</h2>
+      <p class="hint">OBS must send MPEG-TS as an SRT <strong>caller</strong> to this URL. Do not paste it into Stream → Custom — that box is RTMP and reports “failed to connect to server”.</p>
+      <div class="copy-row">
+        <input id="encoderUrl" readonly value="${esc(encoderUrl(s))}" spellcheck="false"/>
+        <button type="button" class="ghost" id="copyEncoder">Copy</button>
+      </div>
+    </div>
   `;
+}
+
+function encoderUrl(s) {
+  const port = s.listenPort || "4001";
+  const latency = s.windowMs || 4000;
+  return `srt://127.0.0.1:${port}?mode=caller&latency=${latency}&pkt_size=1316&transtype=live`;
 }
 
 function renderSettings(c, nets) {
@@ -238,7 +277,7 @@ function renderHelp() {
       </article>
       <article class="help-card card">
         <h3>Encoder</h3>
-        <p>Point any SRT encoder at this kit, usually port <code>4001</code>. Latency must match the contribution window. Do not send the encoder past this kit while it is in the path.</p>
+        <p>On this PC use <code>srt://127.0.0.1:4001?mode=caller&amp;latency=4000&amp;pkt_size=1316&amp;transtype=live</code>. OBS needs an SRT caller / MPEG-TS output. Stream → Custom is RTMP and will say failed to connect to server.</p>
       </article>
       <article class="help-card card">
         <h3>Studio</h3>
@@ -252,7 +291,7 @@ function renderHelp() {
         <li>Settings: ingest host and bonded port from the studio channel.</li>
         <li>Match the window to studio (4000 ms is the usual start).</li>
         <li>Save and reconnect, then start listening on studio.</li>
-        <li>Point your SRT encoder at this kit. Confirm Input shows Live.</li>
+        <li>Copy the encoder URL from Status. In OBS use SRT caller / MPEG-TS, not Stream → Custom RTMP.</li>
       </ol>
     </section>
     <section class="help-block card section">
@@ -262,6 +301,7 @@ function renderHelp() {
         <li>Ingest host must accept UDP. Cloudflare HTTP proxy cannot carry SRTLA.</li>
         <li>Use Reconnect now. The kit also reconnects if every uplink stays down.</li>
         <li>Two-path bonding needs a Linux kit with host networking. Docker Desktop is one NAT path.</li>
+        <li>Ping on usb0 only proves ICMP. The bond is UDP to the ingest host:port. A cellular address still needs source routing (the kit applies that on Linux).</li>
       </ol>
     </section>
     <section class="help-block card section">
@@ -432,7 +472,7 @@ async function showSettings() {
   const [c, s] = await Promise.all([api("/api/config"), api("/api/status")]);
   if (route() !== "settings") return;
   applyHeader(s);
-  document.getElementById("app").innerHTML = renderSettings(c, s.networks);
+  document.getElementById("app").innerHTML = renderSettings(c, visibleNetworks(s.networks));
   bindSettings();
 }
 
@@ -450,6 +490,25 @@ async function tickStatus() {
   if (route() !== "status") return;
   applyHeader(s);
   document.getElementById("app").innerHTML = renderStatus(s);
+  bindEncoderCopy();
+}
+
+function bindEncoderCopy() {
+  const btn = document.getElementById("copyEncoder");
+  const input = document.getElementById("encoderUrl");
+  if (!btn || !input) return;
+  btn.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(input.value);
+      notice("ok", "Encoder URL copied.");
+      setTimeout(() => {
+        if (route() === "status") notice("", "");
+      }, 2500);
+    } catch {
+      input.select();
+      notice("wait", "Select and copy the encoder URL.");
+    }
+  });
 }
 
 let statusTimer = 0;

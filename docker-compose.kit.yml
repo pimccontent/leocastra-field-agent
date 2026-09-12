@@ -1,8 +1,25 @@
-# Linux mini-server overlay: host network so Wi-Fi / LTE IPs are bindable.
-# Usage: docker compose -f docker-compose.yml -f docker-compose.kit.yml up -d
+# Linux mini-server overlay: host network so Ethernet / Wi-Fi / LTE IPs are bindable.
+# Windows/macOS Docker Desktop cannot use this file (no host Wi-Fi/LTE, no source routing).
+# Usage: docker compose -f docker-compose.yml -f docker-compose.kit.yml up -d --build
 services:
   leocastra-field-agent:
     network_mode: host
     ports: !reset []
+    extra_hosts: !reset []
+    privileged: true
     cap_add:
       - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 8
+      start_period: 20s

@@ -2,7 +2,9 @@
 
 Headless contribution kit for live field-to-studio transmission.
 
-The encoder on this machine (or on the same LAN) sends SRT to the Agent. The Agent bonds Ethernet, Wi-Fi, and cellular uplinks and forwards a single resilient path to studio ingest. It starts when the mini server powers on. There is no monitor and no SSH after the first save.
+The encoder on this machine (or on the same LAN) sends SRT to the Agent. The Agent bonds Ethernet, Wi-Fi, and cellular uplinks and forwards a single resilient path to studio ingest. It starts when the mini server powers on. Operators use the Web UI. SSH is for remote maintenance.
+
+**Linux kit (Ubuntu Server):** [docs/ubuntu-kit.md](docs/ubuntu-kit.md)
 
 Open the kit from a phone or laptop on the same network:
 
@@ -14,7 +16,7 @@ Status · Settings · Help
 
 ## What you need
 
-- Ubuntu Server on a mini PC (no desktop)
+- Ubuntu Server **22.04 or 24.04 LTS** on a mini PC (no desktop). See [docs/ubuntu-kit.md](docs/ubuntu-kit.md).
 - One or more uplinks: Ethernet, Wi-Fi, USB LTE, or a mix
 - An encoder that can publish **SRT caller**
 - The **ingest host** and **bonded port** from your studio contribution channel
@@ -37,7 +39,7 @@ From a cloned folder:
 sudo ./install.sh
 ```
 
-Then open **`http://<kit-ip>:8088`** from a phone or laptop on the same LAN. Save ingest host and bonded port. You will not need SSH again.
+Then open **`http://<kit-ip>:8088`** from a phone or laptop on the same LAN. Save ingest host and bonded port. Full Ubuntu kit procedure (OS, DNS, SSH, studio listen, one-sender rule): [docs/ubuntu-kit.md](docs/ubuntu-kit.md).
 
 `install-kit.sh` is the same installer (wrapper).
 
@@ -84,7 +86,7 @@ If the encoder runs on another PC, use the kit LAN IP instead of `127.0.0.1`.
 | Wi-Fi | Normal bonded uplink on a Linux kit |
 | Cellular | USB LTE / modem address |
 
-Auto mode bonds every global IPv4 address. Connect Wi-Fi from **Settings** when the kit has a wireless radio. Two SIMs should be different radio cores.
+Auto mode bonds every global IPv4 on real NICs (Ethernet, Wi-Fi, USB LTE). Docker bridge addresses are ignored. `ping` on `usb0` only proves ICMP; the bond is UDP to the ingest host and bonded port. On Linux the kit installs source routes so each uplink IP leaves through its own interface. Without that, cellular and Ethernet share the default route and SRTLA registration fails even when ping works.
 
 The bond is **UDP** to the ingest host. An HTTPS reverse proxy or CDN in front of the studio website cannot carry this path. The ingest hostname must resolve to the machine that accepts the bonded UDP port, and that port must be open on the firewall.
 
@@ -107,6 +109,7 @@ Leave the kit running. Do not send the encoder past the Agent to studio while th
 2. Confirm ingest host and bonded port in Settings.
 3. Use **Reconnect now**. The kit also reconnects on its own if every uplink stays down.
 4. Two-path bonding needs a Linux kit with host networking. Docker Desktop shows one NAT path.
+5. If logs show `Bond sender exited` / `Failed to establish any initial connections`, SRTLA UDP never registered. Ping can still succeed. Start listening; the kit now sets source routing so `usb0` does not share the Ethernet default route.
 
 Full operator steps live on the kit **Help** page.
 

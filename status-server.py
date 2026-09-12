@@ -131,6 +131,9 @@ def request_restart() -> None:
         raise ValueError(f"Could not request reconnect: {exc}") from exc
 
 
+NOISE_IFACE_PREFIXES = ("docker", "br-", "veth", "cni", "flannel", "virbr")
+
+
 def iface_kind(name: str) -> str:
     n = name.lower()
     if n.startswith(("wlan", "wl", "wifi", "wlp")):
@@ -142,10 +145,39 @@ def iface_kind(name: str) -> str:
     return "other"
 
 
-def read_uplink_ips() -> list[str]:
+def is_noise_iface(name: str) -> bool:
+    n = (name or "").lower()
+    return n == "lo" or n.startswith(NOISE_IFACE_PREFIXES)
+
+
+def is_docker_bridge_ip(ip: str) -> bool:
+    parts = str(ip or "").split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return int(parts[0]) == 172 and int(parts[1]) == 17
+    except ValueError:
+        return False
+
+
+def manual_uplink_ips() -> set[str]:
+    cfg = load_config()
+    if cfg.get("uplinkMode") != "manual":
+        return set()
+    return {str(ip).strip() for ip in (cfg.get("uplinkIps") or []) if str(ip).strip()}
+
+
+def is_hidden_bond_address(ip: str, iface: str = "") -> bool:
+    """Docker/bridge addresses are never operator uplinks unless Manual pins that IP."""
+    if str(ip or "").strip() in manual_uplink_ips():
+        return False
+    return is_noise_iface(iface) or is_docker_bridge_ip(ip)
+
+
+def _ips_from(path: Path) -> list[str]:
     ips: list[str] = []
     try:
-        for raw in UPLINKS_PATH.read_text(encoding="utf-8").splitlines():
+        for raw in path.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if not line or line.startswith("#") or line == "AUTO":
                 continue
@@ -153,6 +185,18 @@ def read_uplink_ips() -> list[str]:
     except OSError:
         pass
     return ips
+
+
+def read_uplink_ips() -> list[str]:
+    for path in (
+        CONFIG_DIR / "uplinks.routable",
+        CONFIG_DIR / "uplinks.resolved",
+        UPLINKS_PATH,
+    ):
+        ips = _ips_from(path)
+        if ips:
+            return [ip for ip in ips if not is_hidden_bond_address(ip)]
+    return []
 
 
 def list_networks() -> list[dict]:
@@ -174,14 +218,18 @@ def list_networks() -> list[dict]:
             stderr=subprocess.DEVNULL,
         )
     except (OSError, subprocess.CalledProcessError):
-        return [{"iface": "unknown", "address": ip, "kind": "other", "bonded": True} for ip in bonded]
+        return [
+            {"iface": "unknown", "address": ip, "kind": "other", "bonded": True}
+            for ip in bonded
+            if not is_hidden_bond_address(ip)
+        ]
     for line in out.splitlines():
         parts = line.split()
         if len(parts) < 4:
             continue
         iface = parts[1]
         addr = parts[3].split("/")[0]
-        if addr.startswith("127."):
+        if addr.startswith("127.") or is_hidden_bond_address(addr, iface):
             continue
         kind = iface_kind(iface)
         rows.append(
@@ -236,7 +284,10 @@ def snapshot() -> dict:
     cfg = load_config()
     metrics = scrape_metrics()
     networks = list_networks()
-    uplink_order = read_uplink_ips()
+    iface_by_ip = {str(n.get("address") or ""): str(n.get("iface") or "") for n in networks}
+    uplink_order = [
+        ip for ip in read_uplink_ips() if not is_hidden_bond_address(ip, iface_by_ip.get(ip, ""))
+    ]
     labels = ["Link A", "Link B", "Satellite"]
     by_ip: dict[str, dict] = {}
     for name, rows in metrics.items():
@@ -245,13 +296,17 @@ def snapshot() -> dict:
         key = name[len("srtla_send_link_") :]
         for labels_map, value in rows:
             ip = labels_map.get("ip") or labels_map.get("addr") or labels_map.get("link") or ""
-            if not ip:
+            if not ip or is_hidden_bond_address(ip, iface_by_ip.get(ip, "")):
                 continue
             slot = by_ip.setdefault(ip, {"ip": ip})
             slot[key] = value
     links = []
     ordered_ips = uplink_order or [n["address"] for n in networks] or list(by_ip.keys())
-    extra = [ip for ip in by_ip if ip not in ordered_ips]
+    extra = [
+        ip
+        for ip in by_ip
+        if ip not in ordered_ips and not is_hidden_bond_address(ip, iface_by_ip.get(ip, ""))
+    ]
     for index, ip in enumerate(ordered_ips + extra):
         row = by_ip.get(ip, {"ip": ip})
         up = bool(row.get("up", 0))
@@ -262,6 +317,7 @@ def snapshot() -> dict:
                 "ip": ip,
                 "kind": kind_for_ip(ip, networks),
                 "up": up,
+                "state": "up" if up else ("waiting" if not metrics else "down"),
                 "rttMs": round(float(row.get("rtt_ms", 0) or 0)),
                 "bitrateKbps": round(bitrate * 8 / 1000),
                 "inFlight": int(row.get("in_flight", 0) or 0),
@@ -270,8 +326,8 @@ def snapshot() -> dict:
             }
         )
     total_bitrate = sum(link["bitrateKbps"] for link in links)
-    active = int(gauge(metrics, "srtla_send_active_links"))
-    total_links = int(gauge(metrics, "srtla_send_total_links", max(len(links), 1)))
+    active = sum(1 for link in links if link.get("up"))
+    total_links = len(links)
     in_flight = int(gauge(metrics, "srtla_send_total_in_flight")) or sum(
         int(link.get("inFlight") or 0) for link in links
     )
@@ -301,7 +357,7 @@ def snapshot() -> dict:
             "active": active,
             "configured": total_links,
             "mode": mode,
-            "label": f"{active}/{total_links}",
+            "label": f"{active}/{total_links}" if metrics else "Restarting",
         },
         "path": {
             "rttMs": max(rtt_values) if rtt_values else None,
