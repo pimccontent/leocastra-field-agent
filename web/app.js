@@ -102,6 +102,35 @@ function renderStatus(s) {
   const naks = s.path ? s.path.naks || 0 : 0;
   const bitrate = s.encoder.bitrateKbps ? `${s.encoder.bitrateKbps} kbps` : "0 kbps";
   const inputLabel = s.encoder.receiving ? (s.encoder.label || "Live") : "No Feed";
+  const linkRows =
+    visibleLinks(s.links)
+      .map((l) =>
+        [
+          "<tr>",
+          `<td>${esc(l.label)}</td>`,
+          `<td><code>${esc(l.ip)}</code></td>`,
+          `<td>${esc(l.kind || "—")}</td>`,
+          `<td class="${l.up ? "ok" : s.metricsOk ? "down" : "wait"}">${esc(l.up ? "Up" : s.metricsOk ? "Down" : "Waiting")}</td>`,
+          `<td>${l.bitrateKbps} kbps</td>`,
+          `<td>${l.rttMs} ms</td>`,
+          `<td>${l.naks}</td>`,
+          "</tr>",
+        ].join(""),
+      )
+      .join("") || '<tr><td colspan="7" class="muted">No uplinks</td></tr>';
+  const networkRows =
+    visibleNetworks(s.networks)
+      .map((n) =>
+        [
+          "<tr>",
+          `<td>${esc(n.iface)}</td>`,
+          `<td><code>${esc(n.address)}</code></td>`,
+          `<td>${esc(n.kind)}</td>`,
+          `<td>${n.bonded ? "Yes" : "No"}</td>`,
+          "</tr>",
+        ].join(""),
+      )
+      .join("") || '<tr><td colspan="4" class="muted">No addresses</td></tr>';
   return `
     <div class="grid">
       <div class="card">
@@ -131,16 +160,7 @@ function renderStatus(s) {
         <table>
           <thead><tr><th>Link</th><th>Bind</th><th>Kind</th><th>State</th><th>Bitrate</th><th>RTT</th><th>NAKs</th></tr></thead>
           <tbody>
-            ${(visibleLinks(s.links).map((l) => `
-              <tr>
-                <td>${esc(l.label)}</td>
-                <td><code>${esc(l.ip)}</code></td>
-                <td>${esc(l.kind || "—")}</td>
-                <td class="${l.up ? "ok" : (s.metricsOk ? "down" : "wait")}">${esc(l.up ? "Up" : (s.metricsOk ? "Down" : "Waiting"))}</td>
-                <td>${l.bitrateKbps} kbps</td>
-                <td>${l.rttMs} ms</td>
-                <td>${l.naks}</td>
-              </tr>`).join("") || `<tr><td colspan="7" class="muted">No uplinks</td></tr>`}
+            ${linkRows}
           </tbody>
         </table>
       </div>
@@ -151,13 +171,7 @@ function renderStatus(s) {
         <table>
           <thead><tr><th>Interface</th><th>Address</th><th>Kind</th><th>Bond</th></tr></thead>
           <tbody>
-            ${(visibleNetworks(s.networks).map((n) => `
-              <tr>
-                <td>${esc(n.iface)}</td>
-                <td><code>${esc(n.address)}</code></td>
-                <td>${esc(n.kind)}</td>
-                <td>${n.bonded ? "Yes" : "No"}</td>
-              </tr>`).join("") || `<tr><td colspan="4" class="muted">No addresses</td></tr>`}
+            ${networkRows}
           </tbody>
         </table>
       </div>
