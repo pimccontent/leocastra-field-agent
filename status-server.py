@@ -410,7 +410,8 @@ def snapshot() -> dict:
     in_flight = int(gauge(metrics, "srtla_send_total_in_flight")) or sum(
         int(link.get("inFlight") or 0) for link in links
     )
-    encoder_receiving = total_bitrate > 8 or in_flight > 0
+    # Bond keepalives leave in_flight > 0 with 0 kbps. That is not an encoder.
+    encoder_receiving = total_bitrate > 8
     ingest = (
         f"{cfg['leocastraHost']}:{cfg['bondedPort']}" if cfg.get("leocastraHost") else ""
     )

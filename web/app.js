@@ -134,7 +134,7 @@ function renderStatus(s) {
   return `
     <div class="grid">
       <div class="card">
-        ${label("Input", "SRT caller from your encoder to this kit. Live means packets are arriving.")}
+        ${label("Input", "SRT caller from your encoder to this kit. Live means video bitrate is arriving. Bond keepalives alone are No Feed.")}
         <div class="metric ${cls(s.encoder.receiving ? "ok" : "wait")}">${esc(inputLabel)}</div>
         <p class="hint">${esc(bitrate)}</p>
       </div>
@@ -175,26 +175,45 @@ function renderStatus(s) {
           </tbody>
         </table>
       </div>
-      <p class="hint" style="margin-top:0.8rem">${s.metricsOk ? "Live · 2 s refresh" : "Bond metrics unavailable"}</p>
+      <p class="hint" style="margin-top:0.8rem">${s.metricsOk ? "Updating every 2 s" : "Bond metrics unavailable"}</p>
     </div>
     <div class="section card">
       <h2>Encoder</h2>
-      <p class="hint">OBS must send MPEG-TS as an SRT <strong>caller</strong> to this URL. Do not paste it into Stream → Custom — that box is RTMP and reports “failed to connect to server”.</p>
+      <p class="hint">OBS: Settings → Stream → Service <strong>Custom</strong>. Paste this in <strong>Server</strong>. Leave Stream Key empty. Start Streaming. OBS/FFmpeg use latency in <strong>microseconds</strong> (8000 ms window → 8000000). vMix uses milliseconds — use the second URL.</p>
       <div class="copy-row">
         <input id="encoderUrl" readonly value="${esc(encoderUrl(s))}" spellcheck="false"/>
-        <button type="button" class="ghost" id="copyEncoder">Copy</button>
+        <button type="button" class="ghost" id="copyEncoder">Copy OBS</button>
+      </div>
+      <div class="copy-row" style="margin-top:0.5rem">
+        <input id="encoderUrlVmix" readonly value="${esc(encoderUrlVmix(s))}" spellcheck="false"/>
+        <button type="button" class="ghost" id="copyEncoderVmix">Copy vMix</button>
       </div>
     </div>
   `;
 }
 
-function encoderUrl(s) {
-  const port = s.listenPort || "4001";
-  const latency = s.windowMs || 4000;
-  const host = s.lanIp && s.lanIp !== "127.0.0.1" ? s.lanIp : "127.0.0.1";
-  const ttl = s.lossMaxTtl || Math.max(80, Math.min(400, Math.round(latency / 20)));
+function encoderQuery(s, latency) {
+  const ttl = s.lossMaxTtl || Math.max(80, Math.min(400, Math.round((s.windowMs || 4000) / 20)));
   const ohead = s.oheadBw || 50;
-  return `srt://${host}:${port}?mode=caller&latency=${latency}&rcvlatency=${latency}&peerlatency=${latency}&pkt_size=1316&transtype=live&tlpktdrop=0&oheadbw=${ohead}&lossmaxttl=${ttl}`;
+  return `mode=caller&latency=${latency}&rcvlatency=${latency}&peerlatency=${latency}&pkt_size=1316&transtype=live&tlpktdrop=0&oheadbw=${ohead}&lossmaxttl=${ttl}`;
+}
+
+function encoderHostPort(s) {
+  const port = s.listenPort || "4001";
+  const host = s.lanIp && s.lanIp !== "127.0.0.1" ? s.lanIp : "127.0.0.1";
+  return { host, port };
+}
+
+function encoderUrl(s) {
+  const { host, port } = encoderHostPort(s);
+  const ms = Math.max(20, Math.round(Number(s.windowMs) || 4000));
+  return `srt://${host}:${port}?${encoderQuery(s, ms * 1000)}`;
+}
+
+function encoderUrlVmix(s) {
+  const { host, port } = encoderHostPort(s);
+  const ms = Math.max(20, Math.round(Number(s.windowMs) || 4000));
+  return `srt://${host}:${port}?${encoderQuery(s, ms)}`;
 }
 
 function renderSettings(c, nets) {
@@ -294,7 +313,7 @@ function renderHelp() {
       </article>
       <article class="help-card card">
         <h3>Encoder</h3>
-        <p>Copy the encoder URL from Status (it includes the window, reorder TTL, and retransmission headroom). OBS needs an SRT caller / MPEG-TS output. Stream → Custom is RTMP and will say failed to connect to server. If OBS has its own latency box, set it to the same window — a 4 ms default will glitch even when studio is 8000 ms.</p>
+        <p>Copy <strong>OBS</strong> from Status. Settings → Stream → Service Custom. Paste in Server. Leave Stream Key empty. OBS latency is microseconds (Ghana 8000 ms → 8000000 in the URL). Then Start Streaming. vMix uses the milliseconds URL.</p>
       </article>
       <article class="help-card card">
         <h3>Studio</h3>
@@ -308,7 +327,7 @@ function renderHelp() {
         <li>Settings: ingest host and bonded port from the studio channel.</li>
         <li>Match the window to studio (Ghana cellular: 8000 ms on both).</li>
         <li>Save and reconnect, then start listening on studio.</li>
-        <li>Copy the encoder URL from Status. In OBS use SRT caller / MPEG-TS, not Stream → Custom RTMP.</li>
+        <li>Copy the OBS URL from Status. Settings → Stream → Custom → Server. Stream Key empty. Start Streaming. Studio must be listening on that Field OB channel.</li>
       </ol>
     </section>
     <section class="help-block card section">
@@ -524,14 +543,14 @@ async function tickStatus() {
   bindEncoderCopy();
 }
 
-function bindEncoderCopy() {
-  const btn = document.getElementById("copyEncoder");
-  const input = document.getElementById("encoderUrl");
+function bindCopy(btnId, inputId, okMsg) {
+  const btn = document.getElementById(btnId);
+  const input = document.getElementById(inputId);
   if (!btn || !input) return;
   btn.addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText(input.value);
-      notice("ok", "Encoder URL copied.");
+      notice("ok", okMsg);
       setTimeout(() => {
         if (route() === "status") notice("", "");
       }, 2500);
@@ -540,6 +559,11 @@ function bindEncoderCopy() {
       notice("wait", "Select and copy the encoder URL.");
     }
   });
+}
+
+function bindEncoderCopy() {
+  bindCopy("copyEncoder", "encoderUrl", "OBS URL copied.");
+  bindCopy("copyEncoderVmix", "encoderUrlVmix", "vMix URL copied.");
 }
 
 let statusTimer = 0;
