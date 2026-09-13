@@ -108,6 +108,33 @@ net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 EOF
   sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-leocastra-field-agent.conf >/dev/null 2>&1 || true
+  cat >/etc/netplan/70-leocastra-usb.yaml <<'EOF'
+# USB tethering (usb0, usb1, …) and RNDIS/CDC phones. Match all, not only usb0.
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    usb-tether:
+      match:
+        name: "usb*"
+      dhcp4: true
+      optional: true
+      nameservers:
+        addresses: [8.8.8.8, 1.1.1.1]
+    usb-rndis:
+      match:
+        driver: rndis_host
+      dhcp4: true
+      optional: true
+    usb-cdc:
+      match:
+        driver: cdc_ether
+      dhcp4: true
+      optional: true
+EOF
+  chmod 600 /etc/netplan/70-leocastra-usb.yaml
+  rm -f /etc/netplan/70-usb.yaml
+  netplan apply 2>/dev/null || true
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow 22/tcp
     ufw allow 8088/tcp

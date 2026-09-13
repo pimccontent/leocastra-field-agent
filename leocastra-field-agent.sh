@@ -109,7 +109,9 @@ apply_source_routes() {
 filter_unroutable() {
   dest="$1"
   filtered="$CONFIG_DIR/uplinks.routable"
+  probed="$filtered.ok"
   : > "$filtered"
+  : > "$probed"
   while read -r ip; do
     [ -n "$ip" ] || continue
     iface=$(iface_for_ip "$ip" || true)
@@ -120,10 +122,52 @@ filter_unroutable() {
       echo "Dropping $ip: no route to ingest $dest" >&2
       continue
     fi
+    if [ -f "$CONFIG_DIR/uplinks.skip" ] && awk -v ip="$ip" '$1==ip { found=1 } END { exit !found }' "$CONFIG_DIR/uplinks.skip"; then
+      echo "Dropping $ip: recently failed SRTLA on this path" >&2
+      continue
+    fi
     printf '%s\n' "$ip" >> "$filtered"
+    # Isolated LAN routers still advertise a default. If any uplink can reach
+    # a public resolver, keep only those; otherwise keep the route-get set.
+    # Some USB tethers (Spreadtrum/Android) block ICMP but still carry TCP/UDP.
+    if ping -c 1 -W 2 -I "$iface" 1.1.1.1 >/dev/null 2>&1 \
+      || ping -c 1 -W 2 -I "$iface" 8.8.8.8 >/dev/null 2>&1 \
+      || ping -c 1 -W 2 -I "$ip" 1.1.1.1 >/dev/null 2>&1 \
+      || ping -c 1 -W 2 -I "$ip" 8.8.8.8 >/dev/null 2>&1 \
+      || python3 -c 'import socket, sys
+ip, iface = sys.argv[1], sys.argv[2]
+for dest, port in (("1.1.1.1", 443), ("8.8.8.8", 53)):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        bound = False
+        if iface:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), (iface + "\0").encode())
+                bound = True
+            except OSError:
+                bound = False
+        if not bound:
+            sock.bind((ip, 0))
+        sock.settimeout(3)
+        sock.connect((dest, port))
+        raise SystemExit(0)
+    except OSError:
+        pass
+    finally:
+        sock.close()
+raise SystemExit(1)
+' "$ip" "$iface"
+    then
+      echo "Uplink $ip on $iface has internet" >&2
+      printf '%s\n' "$ip" >> "$probed"
+    else
+      echo "Uplink $ip on $iface failed internet probe" >&2
+    fi
   done < "$UPLINKS_FILE"
-  if [ ! -s "$filtered" ]; then
-    echo "No routable uplink IPs toward $dest" >&2
+  if [ -s "$probed" ]; then
+    cp "$probed" "$filtered"
+  else
+    echo "No uplink passed internet probe toward $dest" >&2
     return 1
   fi
   UPLINKS_FILE="$filtered"
@@ -134,7 +178,7 @@ resolve_uplinks() {
   if grep -v '^[[:space:]]*#' "$UPLINKS_FILE" | grep -q '^AUTO[[:space:]]*$'; then
     resolved="$CONFIG_DIR/uplinks.resolved"
     ip -4 -o addr show scope global 2>/dev/null \
-      | awk '$2 !~ /^(lo|docker[0-9]*|br-|veth|cni|flannel|virbr)/ { print $4 }' \
+      | awk '$2 !~ /^(lo|docker[0-9]*|br-|veth|cni|flannel|virbr)/ && !seen[$2]++ { print $4 }' \
       | cut -d/ -f1 \
       | grep -vE '^(127\.|172\.17\.)' \
       > "$resolved" || true
@@ -168,12 +212,13 @@ try:
     latency = int(cfg.get("latencyMs") or os.environ.get("LATENCY_MS") or 4000)
 except Exception:
     latency = 4000
-timeout = max(8000, min(60000, latency * 2))
+timeout = max(20000, min(60000, latency * 4))
 print("LEOCASTRA_HOST=" + shlex.quote(host))
 print("BONDED_PORT=" + shlex.quote(bonded))
 print("SRT_LISTEN_PORT=" + shlex.quote(listen))
 print("STUDIO_URL=" + shlex.quote(studio))
 print("SRTLA_MODE=" + shlex.quote(mode))
+print("SRTLA_QUALITY=" + ("0" if cfg.get("qualityScoring") is False else "1"))
 print("CONN_TIMEOUT_MS=" + shlex.quote(str(timeout)))
 print("LATENCY_MS=" + shlex.quote(str(latency)))
 PY
@@ -189,7 +234,7 @@ fi
 
 while true; do
   load_runtime
-  export LEOCASTRA_HOST BONDED_PORT SRT_LISTEN_PORT STUDIO_URL LATENCY_MS
+  export LEOCASTRA_HOST BONDED_PORT SRT_LISTEN_PORT STUDIO_URL LATENCY_MS SRTLA_MODE SRTLA_QUALITY CONN_TIMEOUT_MS
   if [ -z "${LEOCASTRA_HOST:-}" ]; then
     echo "Waiting for ingest host in Settings." >&2
     sleep 3
@@ -210,10 +255,15 @@ while true; do
   fi
   echo "Bonding $(tr '\n' ' ' < "$UPLINKS_FILE") -> ${LEOCASTRA_HOST}:${BONDED_PORT} (${DEST_IP:-unresolved})" >&2
   rm -f "$CONFIG_DIR/restart.flag"
+  QUALITY_ARGS=""
+  if [ "${SRTLA_QUALITY:-1}" = "0" ]; then
+    QUALITY_ARGS="--no-quality"
+  fi
   "$SRTLA_SEND_BIN" \
     --metrics-bind "$METRICS_BIND" \
     --mode "${SRTLA_MODE:-enhanced}" \
-    --conn-timeout-ms "${CONN_TIMEOUT_MS:-15000}" \
+    $QUALITY_ARGS \
+    --conn-timeout-ms "${CONN_TIMEOUT_MS:-20000}" \
     "$SRT_LISTEN_PORT" "$LEOCASTRA_HOST" "$BONDED_PORT" "$UPLINKS_FILE" &
   SEND_PID=$!
   echo "$SEND_PID" > "$CONFIG_DIR/srtla.pid"

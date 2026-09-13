@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import time
@@ -17,6 +18,9 @@ from pathlib import Path
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/var/lib/leocastra"))
 CONFIG_PATH = CONFIG_DIR / "config.json"
 UPLINKS_PATH = Path(os.environ.get("UPLINKS_FILE", str(CONFIG_DIR / "uplinks")))
+SKIP_PATH = CONFIG_DIR / "uplinks.skip"
+SKIP_SECONDS = 180
+LOSSY_SKIP_SECONDS = 600
 RESTART_FLAG = CONFIG_DIR / "restart.flag"
 WEB_ROOT = Path(
     os.environ.get(
@@ -62,7 +66,7 @@ def env_defaults() -> dict:
         "uplinkMode": "auto",
         "uplinkIps": [],
         "schedulerMode": os.environ.get("SRTLA_MODE", "enhanced") or "enhanced",
-        "latencyMs": int(os.environ.get("LATENCY_MS", "4000") or 4000),
+        "latencyMs": int(os.environ.get("LATENCY_MS", "8000") or 8000),
         "qualityScoring": True,
     }
 
@@ -89,7 +93,16 @@ def load_config() -> dict:
 
 def conn_timeout_ms(cfg: dict) -> int:
     latency = max(1500, int(cfg.get("latencyMs") or 4000))
-    return max(8000, min(60000, latency * 2))
+    # srtla_send: silence past this tears a path and re-registers. An outage
+    # the SRT buffer can absorb should resume warm (upstream: >= 2x window).
+    # Floor 20s so a USB NAK gap during a 4000 ms window does not drop a path.
+    return max(20000, min(60000, latency * 4))
+
+
+def srt_loss_max_ttl(latency_ms: int) -> int:
+    """Packets to wait after a gap before NAK. Keep in sync with studio field-ob-srt.ts."""
+    latency = max(1500, min(8000, int(latency_ms or 4000)))
+    return max(80, min(400, round(latency / 20)))
 
 
 def save_config(cfg: dict) -> dict:
@@ -123,8 +136,13 @@ def save_config(cfg: dict) -> dict:
     return cleaned
 
 
-def request_restart() -> None:
+def request_restart(*, clear_skips: bool = False) -> None:
     ensure_dirs()
+    if clear_skips:
+        try:
+            SKIP_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
     try:
         RESTART_FLAG.write_text(str(time.time()), encoding="utf-8")
     except OSError as exc:
@@ -199,6 +217,37 @@ def read_uplink_ips() -> list[str]:
     return []
 
 
+def list_link_ifaces() -> list[dict]:
+    """Non-noise interfaces from `ip -br link`, including those with no IPv4 yet."""
+    rows: list[dict] = []
+    try:
+        out = subprocess.check_output(
+            ["ip", "-br", "link"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return rows
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        iface = parts[0].split("@", 1)[0]
+        state = parts[1].upper()
+        if is_noise_iface(iface):
+            continue
+        rows.append(
+            {
+                "iface": iface,
+                "address": "",
+                "kind": iface_kind(iface),
+                "bonded": False,
+                "oper": state,
+            }
+        )
+    return rows
+
+
 def list_networks() -> list[dict]:
     bonded = set(read_uplink_ips())
     auto = False
@@ -210,7 +259,7 @@ def list_networks() -> list[dict]:
         }
     except OSError:
         auto = True
-    rows: list[dict] = []
+    by_iface: dict[str, list[dict]] = {}
     try:
         out = subprocess.check_output(
             ["ip", "-4", "-o", "addr", "show"],
@@ -218,11 +267,7 @@ def list_networks() -> list[dict]:
             stderr=subprocess.DEVNULL,
         )
     except (OSError, subprocess.CalledProcessError):
-        return [
-            {"iface": "unknown", "address": ip, "kind": "other", "bonded": True}
-            for ip in bonded
-            if not is_hidden_bond_address(ip)
-        ]
+        out = ""
     for line in out.splitlines():
         parts = line.split()
         if len(parts) < 4:
@@ -232,14 +277,27 @@ def list_networks() -> list[dict]:
         if addr.startswith("127.") or is_hidden_bond_address(addr, iface):
             continue
         kind = iface_kind(iface)
-        rows.append(
+        by_iface.setdefault(iface, []).append(
             {
                 "iface": iface,
                 "address": addr,
                 "kind": kind,
-                "bonded": auto or addr in bonded,
+                "bonded": addr in bonded if bonded else auto,
             }
         )
+    rows: list[dict] = []
+    seen = set()
+    for link in list_link_ifaces():
+        iface = link["iface"]
+        seen.add(iface)
+        addrs = by_iface.get(iface) or []
+        if addrs:
+            rows.extend(addrs)
+        else:
+            rows.append(link)
+    for iface, addrs in by_iface.items():
+        if iface not in seen:
+            rows.extend(addrs)
     return rows
 
 
@@ -285,8 +343,11 @@ def snapshot() -> dict:
     metrics = scrape_metrics()
     networks = list_networks()
     iface_by_ip = {str(n.get("address") or ""): str(n.get("iface") or "") for n in networks}
+    live_addrs = {str(n.get("address") or "") for n in networks if n.get("address")}
     uplink_order = [
-        ip for ip in read_uplink_ips() if not is_hidden_bond_address(ip, iface_by_ip.get(ip, ""))
+        ip
+        for ip in read_uplink_ips()
+        if ip in live_addrs and not is_hidden_bond_address(ip, iface_by_ip.get(ip, ""))
     ]
     labels = ["Link A", "Link B", "Satellite"]
     by_ip: dict[str, dict] = {}
@@ -301,11 +362,20 @@ def snapshot() -> dict:
             slot = by_ip.setdefault(ip, {"ip": ip})
             slot[key] = value
     links = []
-    ordered_ips = uplink_order or [n["address"] for n in networks] or list(by_ip.keys())
+    ordered_ips = list(uplink_order)
+    if not ordered_ips:
+        ordered_ips = [
+            ip
+            for ip in by_ip
+            if ip in live_addrs
+            and not is_hidden_bond_address(ip, iface_by_ip.get(ip, ""))
+        ]
     extra = [
         ip
         for ip in by_ip
-        if ip not in ordered_ips and not is_hidden_bond_address(ip, iface_by_ip.get(ip, ""))
+        if ip not in ordered_ips
+        and ip in live_addrs
+        and not is_hidden_bond_address(ip, iface_by_ip.get(ip, ""))
     ]
     for index, ip in enumerate(ordered_ips + extra):
         row = by_ip.get(ip, {"ip": ip})
@@ -338,7 +408,21 @@ def snapshot() -> dict:
     up_links = [link for link in links if link.get("up")]
     rtt_values = [int(link.get("rttMs") or 0) for link in up_links]
     naks_total = sum(int(link.get("naks") or 0) for link in links)
-    lan_ip = next((n.get("address") or "" for n in networks if n.get("address")), "")
+    lan_ip = next(
+        (
+            n.get("address") or ""
+            for n in networks
+            if n.get("kind") == "ethernet" and n.get("address")
+        ),
+        next(
+            (
+                n.get("address") or ""
+                for n in networks
+                if str(n.get("address") or "").startswith("192.168.0.")
+            ),
+            next((n.get("address") or "" for n in networks if n.get("address")), ""),
+        ),
+    )
     mode = "enhanced" if int(gauge(metrics, "srtla_send_mode", 1)) == 1 else "classic"
     return {
         "listenPort": str(cfg.get("listenPort") or ""),
@@ -347,6 +431,8 @@ def snapshot() -> dict:
         "hostname": socket.gethostname(),
         "lanIp": lan_ip,
         "windowMs": int(cfg.get("latencyMs") or 4000),
+        "lossMaxTtl": srt_loss_max_ttl(int(cfg.get("latencyMs") or 4000)),
+        "oheadBw": 50,
         "metricsOk": bool(metrics),
         "encoder": {
             "receiving": encoder_receiving,
@@ -505,7 +591,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/restart":
             try:
-                request_restart()
+                request_restart(clear_skips=True)
                 self._json(200, {"ok": True})
             except ValueError as exc:
                 self._json(500, {"error": str(exc)})
@@ -525,30 +611,399 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
 
-def watchdog_loop() -> None:
-    """If every uplink stays down, bounce srtla_send so REG1 can run again."""
-    down_since: float | None = None
-    last_restart = 0.0
-    while True:
-        time.sleep(5)
-        snap = snapshot()
-        if not snap.get("metricsOk"):
+def auto_candidate_ips() -> list[str]:
+    """One global IPv4 per real iface — same AUTO rule as the bond sender.
+
+    Cellular/Wi-Fi first so a LAN NIC that cannot reach the internet does not
+    stall the watchdog (each failed ping is a 2s wait).
+    """
+    seen_iface: set[str] = set()
+    ranked: list[tuple[int, str]] = []
+    for row in list_networks():
+        iface = str(row.get("iface") or "")
+        addr = str(row.get("address") or "").strip()
+        if not addr or iface in seen_iface:
             continue
-        active = int((snap.get("bond") or {}).get("active") or 0)
-        now = time.time()
-        if active > 0:
-            down_since = None
+        if is_hidden_bond_address(addr, iface):
             continue
-        if down_since is None:
-            down_since = now
-            continue
-        if now - down_since >= 20 and now - last_restart >= 20:
+        seen_iface.add(iface)
+        kind = str(row.get("kind") or "other")
+        rank = 0 if kind in ("cellular", "wifi") else 1
+        ranked.append((rank, addr))
+    ranked.sort(key=lambda item: item[0])
+    return [addr for _, addr in ranked]
+
+
+def iface_for_ip(ip: str) -> str:
+    for row in list_networks():
+        if str(row.get("address") or "") == ip:
+            return str(row.get("iface") or "")
+    return ""
+
+
+def ping_internet(ip: str) -> bool:
+    """Probe via the NIC, not only the source IP.
+
+    Dual-default tethers (usb0+usb1) send `ping -I <usb1-ip>` out usb0, so a
+    phone with internet still looks unroutable and never joins the bond.
+    """
+    iface = iface_for_ip(ip)
+    ident = iface or ip
+    try:
+        proc = subprocess.run(
+            ["ping", "-c", "1", "-W", "2", "-I", ident, "1.1.1.1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=4,
+        )
+        if proc.returncode == 0:
+            return True
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if iface:
             try:
-                request_restart()
-            except ValueError:
-                pass
-            last_restart = now
-            down_since = now
+                sock.setsockopt(
+                    socket.SOL_SOCKET,
+                    getattr(socket, "SO_BINDTODEVICE", 25),
+                    (iface + "\0").encode(),
+                )
+            except OSError:
+                sock.bind((ip, 0))
+        else:
+            sock.bind((ip, 0))
+        sock.settimeout(3)
+        sock.connect(("1.1.1.1", 443))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def bring_tether_ifaces_up() -> None:
+    """RNDIS/CDC gadgets often appear DOWN until something sets the admin flag."""
+    for link in list_link_ifaces():
+        iface = str(link.get("iface") or "")
+        if not iface.startswith(("usb", "enx", "wwan", "wlan")):
+            continue
+        if str(link.get("oper") or "").upper() not in ("DOWN", "LOWERLAYERDOWN"):
+            continue
+        try:
+            subprocess.run(
+                ["ip", "link", "set", iface, "up"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def live_addresses() -> set[str]:
+    return {str(n.get("address") or "") for n in list_networks() if n.get("address")}
+
+
+def read_skips() -> dict[str, float]:
+    kept: dict[str, float] = {}
+    try:
+        for raw in SKIP_PATH.read_text(encoding="utf-8").splitlines():
+            parts = raw.split()
+            if not parts:
+                continue
+            ip = parts[0].strip()
+            exp = float(parts[1]) if len(parts) > 1 else time.time() + SKIP_SECONDS
+            if ip and exp > time.time():
+                kept[ip] = exp
+    except (OSError, ValueError):
+        pass
+    return kept
+
+
+def write_skips(skips: dict[str, float]) -> None:
+    ensure_dirs()
+    now = time.time()
+    lines = [
+        f"{ip} {exp:.0f}\n"
+        for ip, exp in skips.items()
+        if ip and exp > now
+    ]
+    SKIP_PATH.write_text("".join(lines), encoding="utf-8")
+
+
+def skip_ip_set() -> set[str]:
+    return set(read_skips())
+
+
+def remember_skip(ip: str, seconds: int | None = None, reason: str = "") -> None:
+    ip = str(ip or "").strip()
+    if not ip:
+        return
+    seconds = int(seconds or SKIP_SECONDS)
+    skips = read_skips()
+    skips[ip] = time.time() + seconds
+    write_skips(skips)
+    why = reason or "SRTLA stayed down on that path"
+    print(f"Skipping {ip} for {seconds}s — {why}", flush=True)
+
+
+def unique_ips(seq: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for ip in seq:
+        if ip and ip not in seen:
+            seen.add(ip)
+            out.append(ip)
+    return out
+
+
+def sender_pid() -> int | None:
+    try:
+        pid = int((CONFIG_DIR / "srtla.pid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if pid <= 1:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def write_routable(ips: list[str]) -> None:
+    ensure_dirs()
+    (CONFIG_DIR / "uplinks.routable").write_text(
+        "".join(f"{ip}\n" for ip in ips),
+        encoding="utf-8",
+    )
+
+
+def sighup_sender() -> bool:
+    """Reload BIND_IPS_FILE in-process. Encoder SRT listen port stays up."""
+    pid = sender_pid()
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, signal.SIGHUP)
+        return True
+    except OSError as exc:
+        print(f"SIGHUP srtla_send failed: {exc}", flush=True)
+        return False
+
+
+def gateway_for_iface(iface: str) -> str:
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "route", "show", "default", "dev", iface],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        out = ""
+    parts = out.split()
+    if "via" in parts:
+        idx = parts.index("via")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return ""
+
+
+def set_rp_filter_loose(iface: str = "") -> None:
+    paths = ["/proc/sys/net/ipv4/conf/all/rp_filter"]
+    if iface:
+        paths.append(f"/proc/sys/net/ipv4/conf/{iface}/rp_filter")
+    for path in paths:
+        try:
+            Path(path).write_text("2\n", encoding="ascii")
+        except OSError:
+            pass
+
+
+POLICY_TABLES = range(110, 120)
+POLICY_FROM = re.compile(r"from\s+(\d+\.\d+\.\d+\.\d+)\s+lookup\s+(\d+)")
+ADD_STABLE_S = 6.0
+DROP_GONE_S = 2.0
+SIGHUP_COOLDOWN_S = 8.0
+
+
+def _ip(*args: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            ["ip", *args],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return subprocess.CompletedProcess(["ip", *args], 1)
+
+
+def list_policy_rules() -> list[tuple[str, int]]:
+    """Bond policy rules: (from_ip, table) for tables 110–119."""
+    try:
+        out = subprocess.check_output(
+            ["ip", "rule", "list"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    rows: list[tuple[str, int]] = []
+    for match in POLICY_FROM.finditer(out):
+        table = int(match.group(2))
+        if table in POLICY_TABLES:
+            rows.append((match.group(1), table))
+    return rows
+
+
+def drop_policy_for_ip(ip: str) -> None:
+    for _ in range(8):
+        if _ip("rule", "del", "from", ip).returncode != 0:
+            break
+
+
+def ensure_source_route(ip: str) -> None:
+    """Add a from-IP policy route so a newly plugged tether is not sent via another NIC."""
+    iface = iface_for_ip(ip)
+    if not iface:
+        return
+    rules = list_policy_rules()
+    if any(from_ip == ip for from_ip, _ in rules):
+        set_rp_filter_loose(iface)
+        return
+    used = {table for _, table in rules}
+    table = next((n for n in POLICY_TABLES if n not in used), 119)
+    gw = gateway_for_iface(iface)
+    set_rp_filter_loose(iface)
+    try:
+        if gw:
+            _ip("route", "replace", "default", "via", gw, "dev", iface, "table", str(table))
+        else:
+            _ip("route", "replace", "default", "dev", iface, "table", str(table))
+        _ip("rule", "add", "from", ip, "lookup", str(table), "pref", str(table))
+    except OSError:
+        pass
+
+
+def reconcile_source_routes(desired: list[str]) -> None:
+    """One policy route per live bond IP. Drop leftovers from unplug/DHCP so tables 110–119 do not fill."""
+    wanted = set(desired)
+    stale_tables: set[int] = set()
+    for from_ip, table in list_policy_rules():
+        if from_ip not in wanted:
+            drop_policy_for_ip(from_ip)
+            stale_tables.add(table)
+    for table in stale_tables:
+        _ip("route", "flush", "table", str(table))
+    for ip in desired:
+        ensure_source_route(ip)
+
+
+def is_bondable_ip(ip: str, networks: list[dict]) -> bool:
+    return bool(ip) and kind_for_ip(ip, networks) != "ethernet"
+
+
+def watchdog_loop() -> None:
+    """Reconcile uplinks onto the live sender. Topology never restarts srtla_send.
+
+    Unplug / carrier down: drop the vanished IP after a short debounce so a dead
+    bind (typical on usb0 DHCP) cannot stall packet forwarding on the remaining
+    path. Replug / new DHCP: wait until the address is stable, then SIGHUP add.
+    Remaining Up IPs stay in the bind file on every reload.
+    """
+    pending_add: dict[str, float] = {}
+    gone_since: dict[str, float] = {}
+    last_sighup = 0.0
+    while True:
+        time.sleep(2)
+        try:
+            bring_tether_ifaces_up()
+            cfg = load_config()
+            if str(cfg.get("uplinkMode") or "auto") == "manual":
+                continue
+            now = time.time()
+            snap = snapshot()
+            networks = snap.get("networks") or list_networks()
+            live = {
+                str(n.get("address") or "")
+                for n in networks
+                if n.get("address")
+            }
+            current = [
+                ip for ip in read_uplink_ips() if is_bondable_ip(ip, networks) or ip not in live
+            ]
+            current = unique_ips(current)
+
+            for ip in list(gone_since):
+                if ip in live:
+                    gone_since.pop(ip, None)
+            for ip in current:
+                if ip not in live:
+                    gone_since.setdefault(ip, now)
+
+            keep: list[str] = []
+            for link in snap.get("links") or []:
+                ip = str(link.get("ip") or "")
+                if link.get("up") and ip in live and is_bondable_ip(ip, networks):
+                    keep.append(ip)
+            for ip in current:
+                if ip in live and is_bondable_ip(ip, networks):
+                    keep.append(ip)
+                    continue
+                missing_for = now - gone_since.get(ip, now)
+                if ip not in live and missing_for < DROP_GONE_S:
+                    keep.append(ip)
+            keep = unique_ips(keep)
+
+            added: list[str] = []
+            seen_candidates: set[str] = set()
+            for ip in auto_candidate_ips():
+                seen_candidates.add(ip)
+                if ip in keep or not is_bondable_ip(ip, networks):
+                    pending_add.pop(ip, None)
+                    continue
+                if not ping_internet(ip):
+                    pending_add.pop(ip, None)
+                    continue
+                pending_add.setdefault(ip, now)
+                if now - pending_add[ip] >= ADD_STABLE_S:
+                    added.append(ip)
+            for stale in list(pending_add):
+                if stale not in seen_candidates:
+                    pending_add.pop(stale, None)
+
+            desired = unique_ips(
+                [ip for ip in current if ip in keep] + [ip for ip in keep if ip not in current] + added
+            )
+            if not desired:
+                desired = [ip for ip in current if ip in live] or current
+
+            reconcile_source_routes([ip for ip in desired if ip in live])
+
+            if (
+                set(desired) != set(current)
+                and desired
+                and now - last_sighup >= SIGHUP_COOLDOWN_S
+                and sender_pid() is not None
+            ):
+                write_routable(desired)
+                if sighup_sender():
+                    last_sighup = now
+                    dropped = [ip for ip in current if ip not in desired]
+                    joined = [ip for ip in desired if ip not in current]
+                    print(
+                        "Bond reconcile (sender kept): "
+                        f"drop [{' '.join(dropped) or '-'}] add [{' '.join(joined) or '-'}] "
+                        f"-> {' '.join(desired)}",
+                        flush=True,
+                    )
+                else:
+                    print("Bond reconcile skipped: srtla_send pid missing", flush=True)
+        except Exception as extra:
+            print(f"watchdog error: {extra}", flush=True)
 
 
 def main() -> None:

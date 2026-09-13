@@ -124,7 +124,7 @@ function renderStatus(s) {
         [
           "<tr>",
           `<td>${esc(n.iface)}</td>`,
-          `<td><code>${esc(n.address)}</code></td>`,
+          `<td><code>${esc(n.address || "—")}</code></td>`,
           `<td>${esc(n.kind)}</td>`,
           `<td>${n.bonded ? "Yes" : "No"}</td>`,
           "</tr>",
@@ -149,7 +149,7 @@ function renderStatus(s) {
         <p class="hint">${s.metricsOk ? "Worst live path" : "Sender offline"}</p>
       </div>
       <div class="card">
-        ${label("Buffer", "Packets currently in flight on the bond. NAKs are retransmit requests from ingest.")}
+        ${label("Buffer", "Packets in flight across the bond. NAKs are SRT retransmit requests. Enhanced uses them to shift traffic off a bad path; too many NAKs on both paths usually means the window is too small.")}
         <div class="metric ${s.metricsOk ? "ok" : "down"}">${esc(buffer)}</div>
         <p class="hint">${naks} NAK${naks === 1 ? "" : "s"}</p>
       </div>
@@ -191,7 +191,10 @@ function renderStatus(s) {
 function encoderUrl(s) {
   const port = s.listenPort || "4001";
   const latency = s.windowMs || 4000;
-  return `srt://127.0.0.1:${port}?mode=caller&latency=${latency}&pkt_size=1316&transtype=live`;
+  const host = s.lanIp && s.lanIp !== "127.0.0.1" ? s.lanIp : "127.0.0.1";
+  const ttl = s.lossMaxTtl || Math.max(80, Math.min(400, Math.round(latency / 20)));
+  const ohead = s.oheadBw || 50;
+  return `srt://${host}:${port}?mode=caller&latency=${latency}&rcvlatency=${latency}&peerlatency=${latency}&pkt_size=1316&transtype=live&tlpktdrop=1&oheadbw=${ohead}&lossmaxttl=${ttl}`;
 }
 
 function renderSettings(c, nets) {
@@ -209,7 +212,7 @@ function renderSettings(c, nets) {
           <input name="bondedPort" type="number" min="1" max="65535" value="${esc(c.bondedPort)}" required/>
         </div>
         <div class="field">
-          ${label("Window (ms)", "Match the studio contribution window. The Agent scales link timeout so a drop inside this budget can resume.")}
+          ${label("Window (ms)", "Must match the studio Field OB window. This is the SRT reassembly budget: Ghana dual-SIM 8000 ms on kit, studio, and encoder. Stop the encoder, save, then start it again.")}
           <input name="latencyMs" type="number" min="1500" max="8000" value="${esc(c.latencyMs)}" required/>
         </div>
         <div class="field">
@@ -224,7 +227,7 @@ function renderSettings(c, nets) {
           <input name="listenPort" type="number" min="1" max="65535" value="${esc(c.listenPort)}" required/>
         </div>
         <div class="field">
-          ${label("Scheduler", "Enhanced scores links in real time. Use Enhanced unless a lab asks otherwise.")}
+          ${label("Scheduler", "Enhanced splits packets by each uplink’s window and in-flight count, then shifts away from NAK-y paths. Classic is capacity-only. Keep Enhanced for bonding.")}
           <select name="schedulerMode">
             <option value="enhanced" ${c.schedulerMode === "enhanced" ? "selected" : ""}>Enhanced</option>
             <option value="classic" ${c.schedulerMode === "classic" ? "selected" : ""}>Classic</option>
@@ -291,7 +294,7 @@ function renderHelp() {
       </article>
       <article class="help-card card">
         <h3>Encoder</h3>
-        <p>On this PC use <code>srt://127.0.0.1:4001?mode=caller&amp;latency=4000&amp;pkt_size=1316&amp;transtype=live</code>. OBS needs an SRT caller / MPEG-TS output. Stream → Custom is RTMP and will say failed to connect to server.</p>
+        <p>Copy the encoder URL from Status (it includes the window, reorder TTL, and retransmission headroom). OBS needs an SRT caller / MPEG-TS output. Stream → Custom is RTMP and will say failed to connect to server. If OBS has its own latency box, set it to the same window — a 4 ms default will glitch even when studio is 8000 ms.</p>
       </article>
       <article class="help-card card">
         <h3>Studio</h3>
@@ -303,7 +306,7 @@ function renderHelp() {
       <ol>
         <li>On the same LAN open <code>http://&lt;kit-ip&gt;:8088</code>.</li>
         <li>Settings: ingest host and bonded port from the studio channel.</li>
-        <li>Match the window to studio (4000 ms is the usual start).</li>
+        <li>Match the window to studio (Ghana cellular: 8000 ms on both).</li>
         <li>Save and reconnect, then start listening on studio.</li>
         <li>Copy the encoder URL from Status. In OBS use SRT caller / MPEG-TS, not Stream → Custom RTMP.</li>
       </ol>
@@ -313,9 +316,18 @@ function renderHelp() {
       <ol>
         <li>Studio channel must be listening. After a studio restart, start listening again.</li>
         <li>Ingest host must accept UDP. Cloudflare HTTP proxy cannot carry SRTLA.</li>
-        <li>Use Reconnect now. The kit also reconnects if every uplink stays down.</li>
+        <li>Use Reconnect now only after ingest settings change. Unplugging one USB reloads that path in place — the remaining uplink must keep the encoder session.</li>
         <li>Two-path bonding needs a Linux kit with host networking. Docker Desktop is one NAT path.</li>
         <li>Ping on usb0 only proves ICMP. The bond is UDP to the ingest host:port. A cellular address still needs source routing (the kit applies that on Linux).</li>
+      </ol>
+    </section>
+    <section class="help-block card section">
+      <h3>How bonding stays smoother than one uplink</h3>
+      <ol>
+        <li><strong>Split</strong> — each MPEG-TS packet goes on one uplink (window ÷ in-flight). Faster links carry more.</li>
+        <li><strong>Balance</strong> — Enhanced scores NAKs so a lossy USB gets less traffic within about 8 s of recovery.</li>
+        <li><strong>Redundancy</strong> — a stalled path is skipped while the other keeps the encoder session. Unplug must not Restart.</li>
+        <li><strong>Reassembly</strong> — studio SRT waits <em>lossmaxttl</em> packets before NAK, inside the window. Match Ghana 8000 ms on kit, studio, and encoder.</li>
       </ol>
     </section>
     <section class="help-block card section">
@@ -494,8 +506,13 @@ function applyHeader(s) {
   const pill = document.getElementById("bondPill");
   if (!pill) return;
   const up = s.bond.active > 0;
-  pill.className = "pill " + (up ? "ok" : s.metricsOk ? "wait" : "down");
-  document.getElementById("bondPillText").textContent = up ? "BOND UP" : "BOND DOWN";
+  const restarting = !s.metricsOk;
+  pill.className = "pill " + (up ? "ok" : restarting ? "wait" : "down");
+  document.getElementById("bondPillText").textContent = up
+    ? "BOND UP"
+    : restarting
+      ? "RESTARTING"
+      : "BOND DOWN";
 }
 
 async function tickStatus() {
