@@ -132,7 +132,7 @@ function renderStatus(s) {
           `<td>${esc(n.iface)}</td>`,
           `<td><code>${esc(n.address || "—")}</code></td>`,
           `<td>${esc(n.kind)}</td>`,
-          `<td>${n.bonded ? "Yes" : "No"}</td>`,
+          `<td>${n.kind === "ethernet" ? "LAN" : n.bonded ? "Yes" : "Pending"}</td>`,
           "</tr>",
         ].join(""),
       )
@@ -181,7 +181,11 @@ function renderStatus(s) {
           </tbody>
         </table>
       </div>
-      <p class="hint" style="margin-top:0.8rem">${s.metricsOk ? "Updating every 2 s" : "Bond metrics unavailable"}</p>
+      <p class="hint" style="margin-top:0.8rem">${
+        s.metricsOk
+          ? "Ethernet Bond is LAN (OBS), not an uplink. Cellular/Wi-Fi show Pending until they join, then Yes."
+          : "Bond metrics unavailable"
+      }</p>
     </div>
     <div class="section card">
       <h2>Encoder</h2>

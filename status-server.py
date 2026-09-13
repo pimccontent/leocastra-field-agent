@@ -925,7 +925,7 @@ def is_bondable_ip(ip: str, networks: list[dict]) -> bool:
 def _https_post_ipv4(
     url: str,
     body: bytes,
-    timeout: float = 15,
+    timeout: float = 5,
     source_ip: str | None = None,
 ) -> int:
     """POST JSON over IPv4. Bind to a bonded uplink so studio HTTPS does not
@@ -970,7 +970,8 @@ def _https_post_ipv4(
 
 
 def path_stats_source_ips(snap: dict) -> list[str]:
-    """Prefer cellular/Wi-Fi. LAN ethernet to studio HTTPS times out on this kit."""
+    """Cellular/Wi-Fi first. Ethernet last — LAN HTTPS often times out, but it
+    is the only path when USB tethers cannot complete TLS to studio."""
     ips: list[str] = []
     seen: set[str] = set()
 
@@ -980,21 +981,13 @@ def path_stats_source_ips(snap: dict) -> list[str]:
             seen.add(value)
             ips.append(value)
 
-    for link in snap.get("links") or []:
-        kind = str(link.get("kind") or "")
-        if link.get("up") and link.get("ip") and kind in ("cellular", "wifi"):
-            add(str(link.get("ip")))
-    for net in snap.get("networks") or []:
-        kind = str(net.get("kind") or "")
-        if net.get("address") and kind in ("cellular", "wifi"):
-            add(str(net.get("address")))
-    for link in snap.get("links") or []:
-        kind = str(link.get("kind") or "")
-        if link.get("up") and link.get("ip") and kind != "ethernet":
-            add(str(link.get("ip")))
-    for net in snap.get("networks") or []:
-        if net.get("address") and str(net.get("kind") or "") != "ethernet":
-            add(str(net.get("address")))
+    for kind in ("cellular", "wifi", "other", "ethernet"):
+        for link in snap.get("links") or []:
+            if link.get("up") and link.get("ip") and str(link.get("kind") or "") == kind:
+                add(str(link.get("ip")))
+        for net in snap.get("networks") or []:
+            if net.get("address") and str(net.get("kind") or "") == kind:
+                add(str(net.get("address")))
     return ips
 
 
@@ -1037,10 +1030,12 @@ def post_path_stats(snap: dict) -> None:
     ).encode("utf-8")
     url = f"{parsed.scheme}://{parsed.netloc}/api/v1/field-ob/{match.group(1)}/path-stats"
     sources = path_stats_source_ips(snap)
+    candidates: list[str | None] = list(sources)
+    candidates.append(None)
     last_error = "no uplink"
-    for source_ip in sources or [None]:
+    for source_ip in candidates:
         try:
-            status = _https_post_ipv4(url, body, source_ip=source_ip or None)
+            status = _https_post_ipv4(url, body, timeout=5, source_ip=source_ip)
             if status >= 400:
                 last_error = f"HTTP {status} via {source_ip or 'default'}"
                 continue
@@ -1157,10 +1152,10 @@ def watchdog_loop() -> None:
             ):
                 dropped = [ip for ip in current if ip not in desired]
                 joined = [ip for ip in desired if ip not in current]
-                encoder_live = int((snap.get("encoder") or {}).get("bitrateKbps") or 0) > 8
-                in_flight = int((snap.get("path") or {}).get("inFlight") or 0)
-                if joined and not dropped and (encoder_live or in_flight > 0):
-                    continue
+                # Bond keepalives leave in_flight > 0 with no encoder. Skipping
+                # add-only SIGHUP on that made replugged LTE sit on Networks
+                # (Bond=No) forever. SIGHUP reloads binds; it does not restart
+                # the SRT listen port.
                 write_routable(desired)
                 if sighup_sender():
                     last_sighup = now
