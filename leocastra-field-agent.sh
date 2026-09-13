@@ -212,7 +212,7 @@ try:
     latency = int(cfg.get("latencyMs") or os.environ.get("LATENCY_MS") or 4000)
 except Exception:
     latency = 4000
-timeout = max(20000, min(60000, latency * 4))
+timeout = max(60000, min(180000, latency * 8))
 print("LEOCASTRA_HOST=" + shlex.quote(host))
 print("BONDED_PORT=" + shlex.quote(bonded))
 print("SRT_LISTEN_PORT=" + shlex.quote(listen))
@@ -263,7 +263,7 @@ while true; do
     --metrics-bind "$METRICS_BIND" \
     --mode "${SRTLA_MODE:-enhanced}" \
     $QUALITY_ARGS \
-    --conn-timeout-ms "${CONN_TIMEOUT_MS:-20000}" \
+    --conn-timeout-ms "${CONN_TIMEOUT_MS:-60000}" \
     "$SRT_LISTEN_PORT" "$LEOCASTRA_HOST" "$BONDED_PORT" "$UPLINKS_FILE" &
   SEND_PID=$!
   echo "$SEND_PID" > "$CONFIG_DIR/srtla.pid"

@@ -106,8 +106,8 @@ def conn_timeout_ms(cfg: dict) -> int:
     latency = max(1500, int(cfg.get("latencyMs") or 4000))
     # srtla_send: silence past this tears a path and re-registers. An outage
     # the SRT buffer can absorb should resume warm (upstream: >= 2x window).
-    # Floor 20s so a USB NAK gap during a 4000 ms window does not drop a path.
-    return max(20000, min(60000, latency * 4))
+    # Floor 60s so Ghana 8s NAK recovery cannot look like a dead path.
+    return max(60000, min(180000, latency * 8))
 
 
 def srt_loss_max_ttl(latency_ms: int) -> int:
