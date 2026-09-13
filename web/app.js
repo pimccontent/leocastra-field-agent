@@ -102,6 +102,12 @@ function renderStatus(s) {
   const naks = s.path ? s.path.naks || 0 : 0;
   const bitrate = s.encoder.bitrateKbps ? `${s.encoder.bitrateKbps} kbps` : "0 kbps";
   const inputLabel = s.encoder.receiving ? (s.encoder.label || "Live") : "No Feed";
+  const sync = s.studioSync || {};
+  const syncHint = !s.studioUrl
+    ? "Paste the studio Field OB URL in Settings so RTT/Drops match studio."
+    : sync.ok
+      ? "Studio synced"
+      : `Studio not synced: ${sync.detail || "waiting"}`;
   const linkRows =
     visibleLinks(s.links)
       .map((l) =>
@@ -144,9 +150,9 @@ function renderStatus(s) {
         <p class="hint">${esc(s.bond.mode)} · ${s.windowMs || "—"} ms window</p>
       </div>
       <div class="card">
-        ${label("RTT", "Worst round-trip among uplinks that are currently up. Updates from srtla_send.")}
+        ${label("RTT", "Worst round-trip among uplinks that are currently up. Updates from srtla_send. Studio RTT must match this — not localhost FFmpeg.")}
         <div class="metric ${cls(rttKind)}">${esc(rtt)}</div>
-        <p class="hint">${s.metricsOk ? "Worst live path" : "Sender offline"}</p>
+        <p class="hint">${s.metricsOk ? "Worst live path" : "Sender offline"} · ${esc(syncHint)}</p>
       </div>
       <div class="card">
         ${label("Buffer", "Packets in flight across the bond. NAKs are SRT retransmit requests. Enhanced uses them to shift traffic off a bad path; too many NAKs on both paths usually means the window is too small.")}

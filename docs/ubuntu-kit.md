@@ -233,15 +233,15 @@ If the live channel still looks busy, stop listening and start listening once so
 
 ## 9. Encoder (after the bond is Up)
 
-On the encoder PC (same LAN as the kit, or on the kit itself):
+On the encoder PC (same LAN as the kit, or on the kit itself). **OBS/FFmpeg use microseconds.** Ghana 8000 ms window → `latency=8000000`. vMix uses milliseconds (`latency=8000`). Copy **OBS** from the kit Status page: Settings → Stream → Service Custom → Server, Stream Key empty.
 
 ```text
-srt://192.168.0.101:4001?mode=caller&latency=4000&pkt_size=1316&transtype=live
+srt://192.168.0.101:4001?mode=caller&latency=8000000&rcvlatency=8000000&peerlatency=8000000&pkt_size=1316&transtype=live&tlpktdrop=0&oheadbw=50&lossmaxttl=400
 ```
 
-Use the kit LAN IP. On the kit itself use `127.0.0.1`. Use **SRT caller / MPEG-TS**. Do not paste this URL into an RTMP “Stream / Custom” box.
+Use the kit LAN IP. On the kit itself use `127.0.0.1`. Use **SRT caller / MPEG-TS**. Do not paste this URL into an RTMP box. Studio must be **Listening** (Start listening). Bond Up with FFmpeg down still fails OBS handshake.
 
-Match `latency` to the contribution window.
+Match `latency` to the contribution window on kit, studio Field OB, and encoder. Paste the studio Field OB page URL into kit Settings so RTT/Drops stay in sync.
 
 ---
 

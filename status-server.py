@@ -46,6 +46,8 @@ METRIC_LINE = re.compile(
 )
 LABEL_PAIR = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="([^"]*)"')
 _LAST_PATH_STATS_ERR = 0.0
+_LAST_PATH_STATS_OK = False
+_LAST_PATH_STATS_DETAIL = "idle"
 _PATH_STATS_LOCK = threading.Lock()
 FIELD_OB_ID = re.compile(
     r"/field-ob/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
@@ -460,6 +462,10 @@ def snapshot() -> dict:
             "inFlight": in_flight,
             "naks": naks_total,
         },
+        "studioSync": {
+            "ok": _LAST_PATH_STATS_OK,
+            "detail": _LAST_PATH_STATS_DETAIL,
+        },
         "links": links,
         "networks": networks,
         "connTimeoutMs": conn_timeout_ms(cfg),
@@ -833,7 +839,7 @@ def set_rp_filter_loose(iface: str = "") -> None:
 
 POLICY_TABLES = range(110, 120)
 POLICY_FROM = re.compile(r"from\s+(\d+\.\d+\.\d+\.\d+)\s+lookup\s+(\d+)")
-ADD_STABLE_S = 6.0
+ADD_STABLE_S = 8.0
 DROP_GONE_S = 2.0
 SIGHUP_COOLDOWN_S = 8.0
 
@@ -919,7 +925,7 @@ def is_bondable_ip(ip: str, networks: list[dict]) -> bool:
 def _https_post_ipv4(
     url: str,
     body: bytes,
-    timeout: float = 12,
+    timeout: float = 15,
     source_ip: str | None = None,
 ) -> int:
     """POST JSON over IPv4. Bind to a bonded uplink so studio HTTPS does not
@@ -963,15 +969,49 @@ def _https_post_ipv4(
         raise
 
 
+def path_stats_source_ips(snap: dict) -> list[str]:
+    """Prefer cellular/Wi-Fi. LAN ethernet to studio HTTPS times out on this kit."""
+    ips: list[str] = []
+    seen: set[str] = set()
+
+    def add(ip: str) -> None:
+        value = str(ip or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            ips.append(value)
+
+    for link in snap.get("links") or []:
+        kind = str(link.get("kind") or "")
+        if link.get("up") and link.get("ip") and kind in ("cellular", "wifi"):
+            add(str(link.get("ip")))
+    for net in snap.get("networks") or []:
+        kind = str(net.get("kind") or "")
+        if net.get("address") and kind in ("cellular", "wifi"):
+            add(str(net.get("address")))
+    for link in snap.get("links") or []:
+        kind = str(link.get("kind") or "")
+        if link.get("up") and link.get("ip") and kind != "ethernet":
+            add(str(link.get("ip")))
+    for net in snap.get("networks") or []:
+        if net.get("address") and str(net.get("kind") or "") != "ethernet":
+            add(str(net.get("address")))
+    return ips
+
+
 def post_path_stats(snap: dict) -> None:
     """Push bond RTT/NAKs to the studio Field OB page (localhost FFmpeg has no path RTT)."""
+    global _LAST_PATH_STATS_ERR, _LAST_PATH_STATS_OK, _LAST_PATH_STATS_DETAIL
     cfg = load_config()
     studio = str(cfg.get("studioUrl") or "").strip()
     match = FIELD_OB_ID.search(studio)
     if not match:
+        _LAST_PATH_STATS_OK = False
+        _LAST_PATH_STATS_DETAIL = "no studio URL"
         return
     parsed = urllib.parse.urlparse(studio)
     if not parsed.scheme or not parsed.netloc:
+        _LAST_PATH_STATS_OK = False
+        _LAST_PATH_STATS_DETAIL = "bad studio URL"
         return
     ingest = str(snap.get("ingest") or "")
     port = int(cfg.get("bondedPort") or 0)
@@ -981,6 +1021,8 @@ def post_path_stats(snap: dict) -> None:
         except ValueError:
             pass
     if port < 1:
+        _LAST_PATH_STATS_OK = False
+        _LAST_PATH_STATS_DETAIL = "no bonded port"
         return
     path = snap.get("path") or {}
     enc = snap.get("encoder") or {}
@@ -990,36 +1032,29 @@ def post_path_stats(snap: dict) -> None:
             "rttMs": int(path.get("rttMs") or 0),
             "naks": int(path.get("naks") or 0),
             "bitrateKbps": int(enc.get("bitrateKbps") or 0),
+            "windowMs": int(cfg.get("latencyMs") or 0),
         }
     ).encode("utf-8")
     url = f"{parsed.scheme}://{parsed.netloc}/api/v1/field-ob/{match.group(1)}/path-stats"
-    source_ip = next(
-        (
-            str(link.get("ip") or "")
-            for link in snap.get("links") or []
-            if link.get("up") and link.get("ip")
-        ),
-        "",
-    )
-    if not source_ip:
-        source_ip = next(
-            (
-                str(n.get("address") or "")
-                for n in snap.get("networks") or list_networks()
-                if n.get("address") and n.get("kind") not in ("ethernet",)
-            ),
-            "",
-        )
-    global _LAST_PATH_STATS_ERR
-    try:
-        status = _https_post_ipv4(url, body, source_ip=source_ip or None)
-        if status >= 400:
-            raise OSError(f"HTTP {status}")
-    except Exception as exc:
-        now = time.time()
-        if now - _LAST_PATH_STATS_ERR >= 30:
-            print(f"path-stats post failed: {exc}", flush=True)
-            _LAST_PATH_STATS_ERR = now
+    sources = path_stats_source_ips(snap)
+    last_error = "no uplink"
+    for source_ip in sources or [None]:
+        try:
+            status = _https_post_ipv4(url, body, source_ip=source_ip or None)
+            if status >= 400:
+                last_error = f"HTTP {status} via {source_ip or 'default'}"
+                continue
+            _LAST_PATH_STATS_OK = True
+            _LAST_PATH_STATS_DETAIL = f"ok via {source_ip or 'default'}"
+            return
+        except Exception as exc:
+            last_error = f"{exc} via {source_ip or 'default'}"
+    _LAST_PATH_STATS_OK = False
+    _LAST_PATH_STATS_DETAIL = last_error
+    now = time.time()
+    if now - _LAST_PATH_STATS_ERR >= 30:
+        print(f"path-stats post failed: {last_error}", flush=True)
+        _LAST_PATH_STATS_ERR = now
 
 
 def post_path_stats_bg(snap: dict) -> None:
@@ -1120,11 +1155,15 @@ def watchdog_loop() -> None:
                 and now - last_sighup >= SIGHUP_COOLDOWN_S
                 and sender_pid() is not None
             ):
+                dropped = [ip for ip in current if ip not in desired]
+                joined = [ip for ip in desired if ip not in current]
+                encoder_live = int((snap.get("encoder") or {}).get("bitrateKbps") or 0) > 8
+                in_flight = int((snap.get("path") or {}).get("inFlight") or 0)
+                if joined and not dropped and (encoder_live or in_flight > 0):
+                    continue
                 write_routable(desired)
                 if sighup_sender():
                     last_sighup = now
-                    dropped = [ip for ip in current if ip not in desired]
-                    joined = [ip for ip in desired if ip not in current]
                     print(
                         "Bond reconcile (sender kept): "
                         f"drop [{' '.join(dropped) or '-'}] add [{' '.join(joined) or '-'}] "
