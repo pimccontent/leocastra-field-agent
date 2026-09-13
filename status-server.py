@@ -8,7 +8,10 @@ import os
 import re
 import signal
 import socket
+import ssl
+import http.client
 import subprocess
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -42,6 +45,12 @@ METRIC_LINE = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)\{?(?P<labels>[^}]*)\}?\s+(?P<value>\S+)"
 )
 LABEL_PAIR = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="([^"]*)"')
+_LAST_PATH_STATS_ERR = 0.0
+_PATH_STATS_LOCK = threading.Lock()
+FIELD_OB_ID = re.compile(
+    r"/field-ob/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.I,
+)
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -906,6 +915,123 @@ def is_bondable_ip(ip: str, networks: list[dict]) -> bool:
     return bool(ip) and kind_for_ip(ip, networks) != "ethernet"
 
 
+def _https_post_ipv4(
+    url: str,
+    body: bytes,
+    timeout: float = 12,
+    source_ip: str | None = None,
+) -> int:
+    """POST JSON over IPv4. Bind to a bonded uplink so studio HTTPS does not
+    take the LAN default route (that path times out on this kit)."""
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
+    if not host:
+        raise OSError("missing host")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    addr = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)[0][4]
+    source = (source_ip, 0) if source_ip else None
+    sock = socket.create_connection(addr, timeout, source)
+    try:
+        if parsed.scheme == "https":
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.sock = sock
+        conn.request(
+            "POST",
+            path,
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Host": host if port in (80, 443) else f"{host}:{port}",
+                "Content-Length": str(len(body)),
+            },
+        )
+        resp = conn.getresponse()
+        resp.read()
+        status = int(resp.status)
+        conn.close()
+        return status
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+def post_path_stats(snap: dict) -> None:
+    """Push bond RTT/NAKs to the studio Field OB page (localhost FFmpeg has no path RTT)."""
+    cfg = load_config()
+    studio = str(cfg.get("studioUrl") or "").strip()
+    match = FIELD_OB_ID.search(studio)
+    if not match:
+        return
+    parsed = urllib.parse.urlparse(studio)
+    if not parsed.scheme or not parsed.netloc:
+        return
+    ingest = str(snap.get("ingest") or "")
+    port = int(cfg.get("bondedPort") or 0)
+    if ":" in ingest:
+        try:
+            port = int(ingest.rsplit(":", 1)[-1])
+        except ValueError:
+            pass
+    if port < 1:
+        return
+    path = snap.get("path") or {}
+    enc = snap.get("encoder") or {}
+    body = json.dumps(
+        {
+            "bondedPort": port,
+            "rttMs": int(path.get("rttMs") or 0),
+            "naks": int(path.get("naks") or 0),
+            "bitrateKbps": int(enc.get("bitrateKbps") or 0),
+        }
+    ).encode("utf-8")
+    url = f"{parsed.scheme}://{parsed.netloc}/api/v1/field-ob/{match.group(1)}/path-stats"
+    source_ip = next(
+        (
+            str(link.get("ip") or "")
+            for link in snap.get("links") or []
+            if link.get("up") and link.get("ip")
+        ),
+        "",
+    )
+    if not source_ip:
+        source_ip = next(
+            (
+                str(n.get("address") or "")
+                for n in snap.get("networks") or list_networks()
+                if n.get("address") and n.get("kind") not in ("ethernet",)
+            ),
+            "",
+        )
+    global _LAST_PATH_STATS_ERR
+    try:
+        status = _https_post_ipv4(url, body, source_ip=source_ip or None)
+        if status >= 400:
+            raise OSError(f"HTTP {status}")
+    except Exception as exc:
+        now = time.time()
+        if now - _LAST_PATH_STATS_ERR >= 30:
+            print(f"path-stats post failed: {exc}", flush=True)
+            _LAST_PATH_STATS_ERR = now
+
+
+def post_path_stats_bg(snap: dict) -> None:
+    if not _PATH_STATS_LOCK.acquire(blocking=False):
+        return
+    def run() -> None:
+        try:
+            post_path_stats(snap)
+        finally:
+            _PATH_STATS_LOCK.release()
+    threading.Thread(target=run, daemon=True, name="path-stats").start()
+
+
 def watchdog_loop() -> None:
     """Reconcile uplinks onto the live sender. Topology never restarts srtla_send.
 
@@ -917,15 +1043,19 @@ def watchdog_loop() -> None:
     pending_add: dict[str, float] = {}
     gone_since: dict[str, float] = {}
     last_sighup = 0.0
+    last_path_post = 0.0
     while True:
         time.sleep(2)
         try:
             bring_tether_ifaces_up()
             cfg = load_config()
-            if str(cfg.get("uplinkMode") or "auto") == "manual":
-                continue
             now = time.time()
             snap = snapshot()
+            if now - last_path_post >= 4:
+                post_path_stats_bg(snap)
+                last_path_post = now
+            if str(cfg.get("uplinkMode") or "auto") == "manual":
+                continue
             networks = snap.get("networks") or list_networks()
             live = {
                 str(n.get("address") or "")

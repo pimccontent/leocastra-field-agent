@@ -194,7 +194,7 @@ function encoderUrl(s) {
   const host = s.lanIp && s.lanIp !== "127.0.0.1" ? s.lanIp : "127.0.0.1";
   const ttl = s.lossMaxTtl || Math.max(80, Math.min(400, Math.round(latency / 20)));
   const ohead = s.oheadBw || 50;
-  return `srt://${host}:${port}?mode=caller&latency=${latency}&rcvlatency=${latency}&peerlatency=${latency}&pkt_size=1316&transtype=live&tlpktdrop=1&oheadbw=${ohead}&lossmaxttl=${ttl}`;
+  return `srt://${host}:${port}?mode=caller&latency=${latency}&rcvlatency=${latency}&peerlatency=${latency}&pkt_size=1316&transtype=live&tlpktdrop=0&oheadbw=${ohead}&lossmaxttl=${ttl}`;
 }
 
 function renderSettings(c, nets) {
@@ -216,7 +216,7 @@ function renderSettings(c, nets) {
           <input name="latencyMs" type="number" min="1500" max="8000" value="${esc(c.latencyMs)}" required/>
         </div>
         <div class="field">
-          ${label("Studio URL", "Optional shortcut only. Not used for the bond.")}
+          ${label("Studio URL", "Paste the studio Field OB page URL. The kit posts RTT and NAKs there so the studio RTT/Drops cards fill in. The bond itself uses ingest host + bonded port above.")}
           <input name="studioUrl" value="${esc(c.studioUrl)}" placeholder="https://studio.example.com" autocomplete="off"/>
         </div>
       </section>
