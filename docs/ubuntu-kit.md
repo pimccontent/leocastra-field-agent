@@ -57,6 +57,7 @@ That proves: image, UI, SRTLA registration, and the live ingest path can work.
 | `usb0` has internet, UI shows Down | Ping is ICMP. UI Down means SRTLA REG failed or sender exited. |
 | `Bond sender exited; restarting in 2s` | `srtla_send` exits when **no** uplink completes SRTLA registration (studio not listening, UDP blocked, or packets leaving the wrong NIC). |
 | Live ingest “captured” on 10180 | Windows Field Agent still sending to that port. One sender per bonded port. |
+| Bond flaps / Agent looks offline on a USB blip | Watchdog used to drop a vanished IP after 2s and SIGHUP the whole bind file. Current image keeps that IP ~15s so `srtla_send` can recover the path. Rebuild the kit after pulling this change. |
 
 The current kit image skips Docker bridges, installs source routes, sets loose `rp_filter`, and shows **Waiting / Restarting** instead of pretending `usb0` is a dead modem.
 

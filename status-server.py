@@ -840,7 +840,11 @@ def set_rp_filter_loose(iface: str = "") -> None:
 POLICY_TABLES = range(110, 120)
 POLICY_FROM = re.compile(r"from\s+(\d+\.\d+\.\d+\.\d+)\s+lookup\s+(\d+)")
 ADD_STABLE_S = 8.0
-DROP_GONE_S = 2.0
+# srtla_send times out paths independently (conn_timeout ≥ 60s). Dropping a
+# USB/DHCP blip after 2s SIGHUPs the whole bind file and looks like the kit
+# going offline. Wait past a typical modem flap; still drop a dead NIC before
+# GLOBAL_TIMEOUT kills the sender.
+DROP_GONE_S = 15.0
 SIGHUP_COOLDOWN_S = 8.0
 
 
@@ -1066,9 +1070,10 @@ def post_path_stats_bg(snap: dict) -> None:
 def watchdog_loop() -> None:
     """Reconcile uplinks onto the live sender. Topology never restarts srtla_send.
 
-    Unplug / carrier down: drop the vanished IP after a short debounce so a dead
-    bind (typical on usb0 DHCP) cannot stall packet forwarding on the remaining
-    path. Replug / new DHCP: wait until the address is stable, then SIGHUP add.
+    Unplug / carrier down: keep the vanished IP in the bind file through a
+    brief DHCP/USB flap so srtla_send can recover that path itself. Only drop
+    it after DROP_GONE_S. Replug / new DHCP: wait until the address is stable,
+    then SIGHUP add.
     Remaining Up IPs stay in the bind file on every reload.
     """
     pending_add: dict[str, float] = {}
