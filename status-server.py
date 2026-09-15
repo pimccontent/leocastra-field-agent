@@ -24,6 +24,8 @@ UPLINKS_PATH = Path(os.environ.get("UPLINKS_FILE", str(CONFIG_DIR / "uplinks")))
 SKIP_PATH = CONFIG_DIR / "uplinks.skip"
 SKIP_SECONDS = 180
 LOSSY_SKIP_SECONDS = 600
+_PENDING_ADD: dict[str, float] = {}
+_LAST_IFACE: dict[str, str] = {}
 RESTART_FLAG = CONFIG_DIR / "restart.flag"
 WEB_ROOT = Path(
     os.environ.get(
@@ -294,6 +296,7 @@ def list_networks() -> list[dict]:
                 "address": addr,
                 "kind": kind,
                 "bonded": addr in bonded if bonded else auto,
+                "joining": addr in _PENDING_ADD and addr not in bonded,
             }
         )
     rows: list[dict] = []
@@ -839,13 +842,12 @@ def set_rp_filter_loose(iface: str = "") -> None:
 
 POLICY_TABLES = range(110, 120)
 POLICY_FROM = re.compile(r"from\s+(\d+\.\d+\.\d+\.\d+)\s+lookup\s+(\d+)")
-ADD_STABLE_S = 8.0
-# srtla_send times out paths independently (conn_timeout ≥ 60s). Dropping a
-# USB/DHCP blip after 2s SIGHUPs the whole bind file and looks like the kit
-# going offline. Wait past a typical modem flap; still drop a dead NIC before
-# GLOBAL_TIMEOUT kills the sender.
-DROP_GONE_S = 15.0
-SIGHUP_COOLDOWN_S = 8.0
+# New DHCP address: wait until it stops flapping, then bind. Do not require
+# ICMP — USB tethers often fail ping and then sat on Bond=No forever.
+ADD_STABLE_S = 3.0
+# Last remaining path: keep a vanished IP so a USB/DHCP blip can come back.
+DROP_GONE_LAST_S = 20.0
+SIGHUP_COOLDOWN_S = 3.0
 
 
 def _ip(*args: str) -> subprocess.CompletedProcess:
@@ -924,6 +926,53 @@ def reconcile_source_routes(desired: list[str]) -> None:
 
 def is_bondable_ip(ip: str, networks: list[dict]) -> bool:
     return bool(ip) and kind_for_ip(ip, networks) != "ethernet"
+
+
+def stable_bind_ips(
+    current: list[str],
+    live: set[str],
+    networks: list[dict],
+    swaps: dict[str, str],
+    added: list[str],
+    *,
+    keep_stale: bool,
+    gone_since: dict[str, float],
+    now: float,
+) -> list[str]:
+    """Keep BIND_IPS_FILE order. srtla_send keys connections by source IP.
+
+    Dropping or replacing slot 0 (usb0) while usb1 is up tears down the SRTLA
+    group registrar. Same-NIC DHCP must append the new address, not swap the
+    live slot, until no other uplink remains.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def append(ip: str) -> None:
+        value = str(ip or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+
+    for ip in current:
+        if ip in swaps and not keep_stale:
+            append(swaps[ip])
+            continue
+        if ip in live and is_bondable_ip(ip, networks):
+            append(ip)
+            continue
+        if keep_stale:
+            append(ip)
+            continue
+        missing_for = now - gone_since.get(ip, now)
+        if missing_for < DROP_GONE_LAST_S:
+            append(ip)
+    for ip in added:
+        append(ip)
+    if keep_stale:
+        for ip in swaps.values():
+            append(ip)
+    return out
 
 
 def _https_post_ipv4(
@@ -1070,16 +1119,17 @@ def post_path_stats_bg(snap: dict) -> None:
 def watchdog_loop() -> None:
     """Reconcile uplinks onto the live sender. Topology never restarts srtla_send.
 
-    Unplug / carrier down: keep the vanished IP in the bind file through a
-    brief DHCP/USB flap so srtla_send can recover that path itself. Only drop
-    it after DROP_GONE_S. Replug / new DHCP: wait until the address is stable,
-    then SIGHUP add.
-    Remaining Up IPs stay in the bind file on every reload.
+    Unplug: if another uplink is live, keep the vanished IP in its BIND_IPS
+    slot so usb1 does not become conn 0. Same NIC, new DHCP: append the new
+    address; never swap a live slot. Same-IP replug: do not SIGHUP — srtla_send
+    reconnects that conn with REG2. SIGHUP only to add IPs, or to compact the
+    last remaining path after DROP_GONE_LAST_S.
     """
-    pending_add: dict[str, float] = {}
+    global _PENDING_ADD
     gone_since: dict[str, float] = {}
     last_sighup = 0.0
     last_path_post = 0.0
+    miss_tries: dict[str, int] = {}
     while True:
         time.sleep(2)
         try:
@@ -1098,69 +1148,117 @@ def watchdog_loop() -> None:
                 for n in networks
                 if n.get("address")
             }
+            for row in networks:
+                ip = str(row.get("address") or "")
+                iface = str(row.get("iface") or "")
+                if ip and iface:
+                    _LAST_IFACE[ip] = iface
             current = [
                 ip for ip in read_uplink_ips() if is_bondable_ip(ip, networks) or ip not in live
             ]
             current = unique_ips(current)
 
-            for ip in list(gone_since):
-                if ip in live:
-                    gone_since.pop(ip, None)
             for ip in current:
                 if ip not in live:
                     gone_since.setdefault(ip, now)
 
-            keep: list[str] = []
-            for link in snap.get("links") or []:
-                ip = str(link.get("ip") or "")
-                if link.get("up") and ip in live and is_bondable_ip(ip, networks):
-                    keep.append(ip)
+            for ip in list(gone_since):
+                if ip in live:
+                    gone_since.pop(ip, None)
+
+            live_uplinks = [
+                ip for ip in current if ip in live and is_bondable_ip(ip, networks)
+            ]
+            swaps: dict[str, str] = {}
             for ip in current:
-                if ip in live and is_bondable_ip(ip, networks):
-                    keep.append(ip)
+                if ip in live:
                     continue
-                missing_for = now - gone_since.get(ip, now)
-                if ip not in live and missing_for < DROP_GONE_S:
-                    keep.append(ip)
-            keep = unique_ips(keep)
+                iface = _LAST_IFACE.get(ip, "")
+                if not iface:
+                    continue
+                for cand in auto_candidate_ips():
+                    if (
+                        cand in live
+                        and cand not in current
+                        and _LAST_IFACE.get(cand, iface_for_ip(cand)) == iface
+                        and is_bondable_ip(cand, networks)
+                    ):
+                        swaps[ip] = cand
+                        if live_uplinks:
+                            print(
+                                f"Bond append {cand} on {iface} "
+                                f"(keep {ip} in slot, sender kept)",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"Bond swap {ip} -> {cand} on {iface} "
+                                f"(same slot, sender kept)",
+                                flush=True,
+                            )
+                        break
 
             added: list[str] = []
             seen_candidates: set[str] = set()
             for ip in auto_candidate_ips():
                 seen_candidates.add(ip)
-                if ip in keep or not is_bondable_ip(ip, networks):
-                    pending_add.pop(ip, None)
+                if (
+                    ip in current
+                    or ip in swaps.values()
+                    or not is_bondable_ip(ip, networks)
+                ):
+                    _PENDING_ADD.pop(ip, None)
                     continue
-                if not ping_internet(ip):
-                    pending_add.pop(ip, None)
-                    continue
-                pending_add.setdefault(ip, now)
-                if now - pending_add[ip] >= ADD_STABLE_S:
+                _PENDING_ADD.setdefault(ip, now)
+                if now - _PENDING_ADD[ip] >= ADD_STABLE_S:
                     added.append(ip)
-            for stale in list(pending_add):
+            for stale in list(_PENDING_ADD):
                 if stale not in seen_candidates:
-                    pending_add.pop(stale, None)
+                    _PENDING_ADD.pop(stale, None)
 
-            desired = unique_ips(
-                [ip for ip in current if ip in keep] + [ip for ip in keep if ip not in current] + added
+            desired = stable_bind_ips(
+                current,
+                live,
+                networks,
+                swaps,
+                added,
+                keep_stale=bool(live_uplinks),
+                gone_since=gone_since,
+                now=now,
             )
             if not desired:
                 desired = [ip for ip in current if ip in live] or current
 
             reconcile_source_routes([ip for ip in desired if ip in live])
 
+            bound_now = {
+                str(link.get("ip") or "")
+                for link in snap.get("links") or []
+                if link.get("ip")
+            }
+            missing_binds = [
+                ip for ip in desired if ip in live and ip not in bound_now
+            ]
+            for ip in list(miss_tries):
+                if ip not in missing_binds:
+                    miss_tries.pop(ip, None)
+            retry_miss = [ip for ip in missing_binds if miss_tries.get(ip, 0) < 8]
+            dropped = [ip for ip in current if ip not in desired]
+            joined = [ip for ip in desired if ip not in current]
+            add_only = bool(joined) and not dropped
+            last_path = not live_uplinks
+            # Same-IP replug: leave the file and sockets alone. srtla_send
+            # reconnects that conn with REG2. A SIGHUP here is what froze MCR
+            # when usb0 reappeared on the Uplinks list.
+            need_reload = bool(desired) and (
+                (desired != current and (add_only or last_path))
+                or (bool(retry_miss) and last_path)
+            )
             if (
-                set(desired) != set(current)
-                and desired
+                need_reload
                 and now - last_sighup >= SIGHUP_COOLDOWN_S
                 and sender_pid() is not None
             ):
-                dropped = [ip for ip in current if ip not in desired]
-                joined = [ip for ip in desired if ip not in current]
-                # Bond keepalives leave in_flight > 0 with no encoder. Skipping
-                # add-only SIGHUP on that made replugged LTE sit on Networks
-                # (Bond=No) forever. SIGHUP reloads binds; it does not restart
-                # the SRT listen port.
                 write_routable(desired)
                 if sighup_sender():
                     last_sighup = now
@@ -1170,6 +1268,10 @@ def watchdog_loop() -> None:
                         f"-> {' '.join(desired)}",
                         flush=True,
                     )
+                    for ip in joined + retry_miss:
+                        _PENDING_ADD.pop(ip, None)
+                        if ip in retry_miss:
+                            miss_tries[ip] = miss_tries.get(ip, 0) + 1
                 else:
                     print("Bond reconcile skipped: srtla_send pid missing", flush=True)
         except Exception as extra:

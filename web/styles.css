@@ -144,29 +144,42 @@ code {
   background: currentColor;
 }
 
-.notice {
-  width: 100%;
-  max-width: 72rem;
-  margin: 0 auto;
-  padding: 0.7rem 1.1rem 0;
+.toasts {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 1.15rem;
+  z-index: 80;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  padding: 0 1rem;
 }
-.banner {
-  padding: 0.7rem 0.9rem;
-  border-radius: 10px;
+.toast {
+  pointer-events: auto;
+  max-width: min(36rem, calc(100vw - 2rem));
+  padding: 0.78rem 1rem;
+  border-radius: 12px;
   font-size: 0.88rem;
   line-height: 1.4;
   overflow-wrap: anywhere;
   border: 1px solid var(--line);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+  animation: toast-in 0.18s ease-out;
 }
-.banner.err { color: var(--down); background: var(--down-bg); border-color: color-mix(in srgb, var(--down) 35%, var(--line)); }
-.banner.ok { color: var(--ok); background: var(--ok-bg); border-color: color-mix(in srgb, var(--ok) 35%, var(--line)); }
-.banner.wait { color: var(--accent-glow); background: var(--wait-bg); border-color: color-mix(in srgb, var(--wait) 35%, var(--line)); }
+.toast.err { color: var(--down); background: #1a1010; border-color: color-mix(in srgb, var(--down) 40%, var(--line)); }
+.toast.ok { color: var(--ok); background: #0f1a16; border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.toast.wait { color: var(--accent-glow); background: #1a1408; border-color: color-mix(in srgb, var(--wait) 40%, var(--line)); }
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
 
 main {
   width: 100%;
   max-width: 72rem;
   margin: 0 auto;
-  padding: 1.15rem 1.1rem 2.5rem;
+  padding: 1.15rem 1.1rem 5.5rem;
   flex: 1 1 auto;
 }
 
@@ -305,6 +318,10 @@ input:focus, select:focus, textarea:focus {
   flex-direction: column;
 }
 .settings-grid > .card { min-height: 100%; }
+.settings-grid > .encoder-card {
+  grid-column: 1 / -1;
+  min-height: 0;
+}
 .apply-copy {
   margin: 0;
   color: var(--muted);
@@ -317,12 +334,15 @@ input:focus, select:focus, textarea:focus {
   margin-top: 0.75rem;
   align-items: stretch;
 }
-.copy-row input {
+.copy-row input,
+.copy-target {
   flex: 1;
   min-width: 0;
   font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
   font-size: 0.82rem;
+  cursor: pointer;
 }
+.copy-row button { flex-shrink: 0; }
 .apply-card .actions { margin-top: auto; padding-top: 1rem; }
 button.primary, button.ghost {
   appearance: none;
@@ -456,7 +476,8 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 @media (max-width: 520px) {
   .grid { grid-template-columns: 1fr; }
   table { min-width: 28rem; }
-  main { padding: 0.9rem 0.8rem 2rem; }
+  main { padding: 0.9rem 0.8rem 5.5rem; }
+  .copy-row { flex-direction: column; }
   .top .shell { padding: 0.55rem 0.7rem 0.65rem; }
   .mark { width: 30px; height: 30px; border-radius: 8px; }
   .pill {

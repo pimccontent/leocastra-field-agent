@@ -57,7 +57,9 @@ That proves: image, UI, SRTLA registration, and the live ingest path can work.
 | `usb0` has internet, UI shows Down | Ping is ICMP. UI Down means SRTLA REG failed or sender exited. |
 | `Bond sender exited; restarting in 2s` | `srtla_send` exits when **no** uplink completes SRTLA registration (studio not listening, UDP blocked, or packets leaving the wrong NIC). |
 | Live ingest “captured” on 10180 | Windows Field Agent still sending to that port. One sender per bonded port. |
-| Bond flaps / Agent looks offline on a USB blip | Watchdog used to drop a vanished IP after 2s and SIGHUP the whole bind file. Current image keeps that IP ~15s so `srtla_send` can recover the path. Rebuild the kit after pulling this change. |
+| Bond flaps / Agent looks offline on a USB blip | Watchdog used to drop a vanished IP after 2s and SIGHUP the whole bind file. Current image keeps the last path ~20s, and **does not remove usb0 from slot 0 while usb1 is still up** (that used to re-register the SRTLA group and freeze MCR). Rebuild or docker-cp `status-server.py` after this change. |
+| Unplug usb0 is fine; replug / Bond=Yes freezes MCR | Watchdog used to SIGHUP (and sometimes swap usb0’s DHCP address into slot 0) the moment that NIC rejoined. That rebinds the group while usb1 is carrying the stream. Current image reconnects a same-IP replug in place, and only SIGHUPs to **add** an extra address. docker-cp `status-server.py`. |
+| Networks Bond stays No / never appears under Uplinks | Replugged LTE used to need ICMP before join. USB tethers often fail ping, so the IP never entered the bind file and OBS dropped. Current image joins a stable cellular/Wi-Fi address after 3s and SIGHUPs in place. |
 
 The current kit image skips Docker bridges, installs source routes, sets loose `rp_filter`, and shows **Waiting / Restarting** instead of pretending `usb0` is a dead modem.
 
@@ -234,7 +236,7 @@ If the live channel still looks busy, stop listening and start listening once so
 
 ## 9. Encoder (after the bond is Up)
 
-On the encoder PC (same LAN as the kit, or on the kit itself). **OBS/FFmpeg use microseconds.** Ghana 8000 ms window → `latency=8000000`. vMix uses milliseconds (`latency=8000`). Copy **OBS** from the kit Status page: Settings → Stream → Service Custom → Server, Stream Key empty.
+On the encoder PC (same LAN as the kit, or on the kit itself). **OBS/FFmpeg use microseconds.** Ghana 8000 ms window → `latency=8000000`. vMix uses milliseconds (`latency=8000`). Copy **OBS** from the kit Settings → Encoder page: Settings → Stream → Service Custom → Server, Stream Key empty.
 
 ```text
 srt://192.168.0.101:4001?mode=caller&latency=8000000&rcvlatency=8000000&peerlatency=8000000&pkt_size=1316&transtype=live&tlpktdrop=0&oheadbw=50&lossmaxttl=400

@@ -59,20 +59,36 @@ function setNav(page) {
 }
 
 function notice(kind, text) {
-  const el = document.getElementById("notice");
+  toast(kind, text);
+}
+
+let toastTimer = 0;
+let toastText = "";
+
+function toast(kind, text) {
+  const el = document.getElementById("toasts");
   if (!el) return;
-  if (!text) {
+  if (toastTimer) {
+    clearTimeout(toastTimer);
+    toastTimer = 0;
+  }
+  toastText = String(text || "");
+  if (!toastText) {
     el.hidden = true;
     el.innerHTML = "";
     return;
   }
   el.hidden = false;
-  el.innerHTML = `<div class="banner ${kind}">${esc(text)}</div>`;
+  el.innerHTML = `<div class="toast ${esc(kind)}" role="status">${esc(toastText)}</div>`;
+  if (kind === "wait") return;
+  const ms = kind === "err" ? 6500 : 2800;
+  toastTimer = setTimeout(() => {
+    if (toastText) toast("", "");
+  }, ms);
 }
 
 function settingsNotice(kind, text) {
-  if (route() !== "settings") return;
-  notice(kind, text);
+  toast(kind, text);
 }
 
 function sleep(ms) {
@@ -107,7 +123,7 @@ function renderStatus(s) {
     ? "Paste the studio Field OB URL in Settings so RTT/Drops match studio."
     : sync.ok
       ? "Studio synced"
-      : `Studio not synced: ${sync.detail || "waiting"}`;
+      : "Studio not synced";
   const linkRows =
     visibleLinks(s.links)
       .map((l) =>
@@ -132,7 +148,7 @@ function renderStatus(s) {
           `<td>${esc(n.iface)}</td>`,
           `<td><code>${esc(n.address || "—")}</code></td>`,
           `<td>${esc(n.kind)}</td>`,
-          `<td>${n.kind === "ethernet" ? "LAN" : n.bonded ? "Yes" : "Pending"}</td>`,
+          `<td>${n.kind === "ethernet" ? "LAN" : n.bonded ? "Yes" : n.joining ? "Joining" : "No"}</td>`,
           "</tr>",
         ].join(""),
       )
@@ -183,21 +199,9 @@ function renderStatus(s) {
       </div>
       <p class="hint" style="margin-top:0.8rem">${
         s.metricsOk
-          ? "Ethernet Bond is LAN (OBS), not an uplink. Cellular/Wi-Fi show Pending until they join, then Yes."
+          ? "Ethernet Bond is LAN (OBS), not an uplink. Cellular/Wi-Fi show Joining then Yes once they bind. No means the address is up but not in the bond yet."
           : "Bond metrics unavailable"
       }</p>
-    </div>
-    <div class="section card">
-      <h2>Encoder</h2>
-      <p class="hint">OBS: Settings → Stream → Service <strong>Custom</strong>. Paste this in <strong>Server</strong>. Leave Stream Key empty. Start Streaming. OBS/FFmpeg use latency in <strong>microseconds</strong> (8000 ms window → 8000000). vMix uses milliseconds — use the second URL.</p>
-      <div class="copy-row">
-        <input id="encoderUrl" readonly value="${esc(encoderUrl(s))}" spellcheck="false"/>
-        <button type="button" class="ghost" id="copyEncoder">Copy OBS</button>
-      </div>
-      <div class="copy-row" style="margin-top:0.5rem">
-        <input id="encoderUrlVmix" readonly value="${esc(encoderUrlVmix(s))}" spellcheck="false"/>
-        <button type="button" class="ghost" id="copyEncoderVmix">Copy vMix</button>
-      </div>
     </div>
   `;
 }
@@ -226,7 +230,23 @@ function encoderUrlVmix(s) {
   return `srt://${host}:${port}?${encoderQuery(s, ms)}`;
 }
 
-function renderSettings(c, nets) {
+function renderEncoderCard(s) {
+  return `
+      <section class="card encoder-card">
+        <h2>Encoder</h2>
+        <p class="hint">OBS: Settings → Stream → Service <strong>Custom</strong>. Click the URL or Copy. Paste in <strong>Server</strong>. Leave Stream Key empty. OBS/FFmpeg use latency in <strong>microseconds</strong> (8000 ms window → 8000000). vMix uses milliseconds — use the second URL. From another PC this uses the kit LAN IP.</p>
+        <div class="copy-row">
+          <input id="encoderUrl" class="copy-target" readonly value="${esc(encoderUrl(s))}" spellcheck="false" title="Click to copy OBS URL"/>
+          <button type="button" class="ghost" id="copyEncoder">Copy OBS</button>
+        </div>
+        <div class="copy-row" style="margin-top:0.5rem">
+          <input id="encoderUrlVmix" class="copy-target" readonly value="${esc(encoderUrlVmix(s))}" spellcheck="false" title="Click to copy vMix URL"/>
+          <button type="button" class="ghost" id="copyEncoderVmix">Copy vMix</button>
+        </div>
+      </section>`;
+}
+
+function renderSettings(c, nets, status) {
   const wifiIfaces = (nets || []).filter((n) => n.kind === "wifi");
   return `
     <form id="settingsForm" class="settings-grid">
@@ -274,6 +294,14 @@ function renderSettings(c, nets) {
           <textarea name="uplinkIps" rows="4">${esc((c.uplinkIps || []).join("\n"))}</textarea>
         </div>
       </section>
+      ${renderEncoderCard({
+        ...status,
+        listenPort: c.listenPort,
+        windowMs: c.latencyMs,
+        lanIp: status && status.lanIp,
+        lossMaxTtl: status && status.lossMaxTtl,
+        oheadBw: status && status.oheadBw,
+      })}
       <section class="card">
         <h2>Wi-Fi ${info("A bonded uplink on Linux kits with host networking. Docker Desktop shows one NAT path.")}</h2>
         <div class="field">
@@ -323,7 +351,7 @@ function renderHelp() {
       </article>
       <article class="help-card card">
         <h3>Encoder</h3>
-        <p>Copy <strong>OBS</strong> from Status. Settings → Stream → Service Custom. Paste in Server. Leave Stream Key empty. OBS latency is microseconds (Ghana 8000 ms → 8000000 in the URL). Then Start Streaming. vMix uses the milliseconds URL.</p>
+        <p>Copy <strong>OBS</strong> from Settings → Encoder. Settings → Stream → Service Custom. Paste in Server. Leave Stream Key empty. OBS latency is microseconds (Ghana 8000 ms → 8000000 in the URL). Then Start Streaming. vMix uses the milliseconds URL.</p>
       </article>
       <article class="help-card card">
         <h3>Studio</h3>
@@ -337,7 +365,7 @@ function renderHelp() {
         <li>Settings: ingest host and bonded port from the studio channel.</li>
         <li>Match the window to studio (Ghana cellular: 8000 ms on both).</li>
         <li>Save and reconnect, then start listening on studio.</li>
-        <li>Copy the OBS URL from Status. Settings → Stream → Custom → Server. Stream Key empty. Start Streaming. Studio must be listening on that Field OB channel.</li>
+        <li>Copy the OBS URL from Settings → Encoder. Settings → Stream → Custom → Server. Stream Key empty. Start Streaming. Studio must be listening on that Field OB channel.</li>
       </ol>
     </section>
     <section class="help-block card section">
@@ -423,6 +451,12 @@ function bindSettings() {
       manual.style.display = mode.value === "manual" ? "" : "none";
     });
   }
+  const form = document.getElementById("settingsForm");
+  ["listenPort", "latencyMs"].forEach((name) => {
+    const el = form && form[name];
+    if (el) el.addEventListener("input", refreshEncoderFields);
+  });
+  bindEncoderCopy();
   document.getElementById("settingsForm").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     let body;
@@ -440,6 +474,14 @@ function bindSettings() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
+      if (lastStatus) {
+        lastStatus = {
+          ...lastStatus,
+          listenPort: body.listenPort,
+          windowMs: body.latencyMs,
+        };
+        refreshEncoderFields();
+      }
     } catch (err) {
       settingsNotice("err", `Save failed: ${err.message}`);
       setBusy(false);
@@ -527,14 +569,18 @@ async function showSettings() {
   const [c, s] = await Promise.all([api("/api/config"), api("/api/status")]);
   if (route() !== "settings") return;
   applyHeader(s);
-  document.getElementById("app").innerHTML = renderSettings(c, visibleNetworks(s.networks));
+  document.getElementById("app").innerHTML = renderSettings(c, visibleNetworks(s.networks), s);
   bindSettings();
 }
 
+let lastStatus = null;
+let statusFailAt = 0;
+
 function applyHeader(s) {
+  lastStatus = s;
   const pill = document.getElementById("bondPill");
   if (!pill) return;
-  const up = s.bond.active > 0;
+  const up = Boolean(s.bond && s.bond.active > 0);
   const restarting = !s.metricsOk;
   pill.className = "pill " + (up ? "ok" : restarting ? "wait" : "down");
   document.getElementById("bondPillText").textContent = up
@@ -544,31 +590,90 @@ function applyHeader(s) {
       : "BOND DOWN";
 }
 
+function refreshEncoderFields() {
+  const form = document.getElementById("settingsForm");
+  const obs = document.getElementById("encoderUrl");
+  const vmix = document.getElementById("encoderUrlVmix");
+  if (!obs || !vmix || !lastStatus) return;
+  const listenPort = form ? Number(form.listenPort.value) || lastStatus.listenPort : lastStatus.listenPort;
+  const windowMs = form ? Number(form.latencyMs.value) || lastStatus.windowMs : lastStatus.windowMs;
+  const snap = { ...lastStatus, listenPort, windowMs };
+  obs.value = encoderUrl(snap);
+  vmix.value = encoderUrlVmix(snap);
+}
+
 async function tickStatus() {
   if (route() !== "status") return;
   const s = await api("/api/status");
   if (route() !== "status") return;
   applyHeader(s);
   document.getElementById("app").innerHTML = renderStatus(s);
-  bindEncoderCopy();
+}
+
+function copyText(value, input) {
+  const text = String(value || "");
+  if (!text) return Promise.reject(new Error("Nothing to copy"));
+  const tryExec = () => {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;top:0;left:0;width:2em;height:2em;padding:0;border:0;opacity:0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    }
+    document.body.removeChild(ta);
+    return ok;
+  };
+  const selectField = () => {
+    if (input && typeof input.select === "function") {
+      input.focus();
+      input.select();
+      if (typeof input.setSelectionRange === "function") {
+        input.setSelectionRange(0, text.length);
+      }
+    }
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text).catch(() => {
+      if (tryExec()) return;
+      selectField();
+      throw new Error("select");
+    });
+  }
+  return new Promise((resolve, reject) => {
+    if (tryExec()) resolve();
+    else {
+      selectField();
+      reject(new Error("select"));
+    }
+  });
 }
 
 function bindCopy(btnId, inputId, okMsg) {
   const btn = document.getElementById(btnId);
   const input = document.getElementById(inputId);
   if (!btn || !input) return;
-  btn.addEventListener("click", async () => {
+  const copy = async () => {
     try {
-      await navigator.clipboard.writeText(input.value);
-      notice("ok", okMsg);
-      setTimeout(() => {
-        if (route() === "status") notice("", "");
-      }, 2500);
-    } catch {
-      input.select();
-      notice("wait", "Select and copy the encoder URL.");
+      await copyText(input.value, input);
+      toast("ok", okMsg);
+    } catch (err) {
+      if (String(err && err.message) === "select") {
+        toast("wait", "URL selected. Press Ctrl+C to copy.");
+      } else {
+        toast("err", "Copy failed. Select the URL and copy it.");
+      }
     }
-  });
+  };
+  btn.addEventListener("click", copy);
+  input.addEventListener("click", copy);
 }
 
 function bindEncoderCopy() {
@@ -578,28 +683,61 @@ function bindEncoderCopy() {
 
 let statusTimer = 0;
 
+async function tickHeader() {
+  try {
+    const s = await api("/api/status");
+    applyHeader(s);
+    if (route() === "settings") refreshEncoderFields();
+  } catch {
+    /* keep last pill */
+  }
+}
+
 async function draw() {
   const page = route();
   setNav(page);
-  if (page !== "settings") notice("", "");
   if (statusTimer) {
     clearInterval(statusTimer);
     statusTimer = 0;
   }
   if (page === "help") {
+    try {
+      await tickHeader();
+    } catch {
+      /* offline */
+    }
     document.getElementById("app").innerHTML = renderHelp();
     return;
   }
   if (page === "settings") {
     await showSettings();
+    statusTimer = setInterval(() => tickHeader(), 4000);
     return;
   }
-  await tickStatus();
-  statusTimer = setInterval(() => tickStatus().catch(() => {}), 2000);
+  try {
+    await tickStatus();
+  } catch (err) {
+    const now = Date.now();
+    if (now - statusFailAt > 15000) {
+      toast("err", err.message || "Status unavailable.");
+      statusFailAt = now;
+    }
+    throw err;
+  }
+  statusTimer = setInterval(() => tickStatus().catch((err) => {
+    const now = Date.now();
+    if (now - statusFailAt > 15000) {
+      toast("err", err.message || "Status unavailable.");
+      statusFailAt = now;
+    }
+  }), 2000);
 }
 
 window.addEventListener("hashchange", () => draw().catch(console.error));
 draw().catch((err) => {
-  notice("err", err.message);
-  document.getElementById("app").innerHTML = "";
+  toast("err", err.message);
+  const app = document.getElementById("app");
+  if (app && (!app.innerHTML || app.innerHTML === "Loading…" || app.innerHTML === "Loading")) {
+    app.innerHTML = `<section class="card"><p class="muted">Could not load kit status. Check that the Field Agent is running, then refresh.</p></section>`;
+  }
 });

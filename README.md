@@ -72,9 +72,7 @@ Then open `http://localhost:8088`.
 5. Leave **Uplink mode** on Auto unless you must pin source IPs.
 6. **Save and reconnect**.
 7. In studio, start listening on the contribution channel.
-8. Point the encoder at this kit: `srt://127.0.0.1:4001` with **caller** mode and the same latency as the window.
-
-If the encoder runs on another PC, use the kit LAN IP instead of `127.0.0.1`.
+8. Open **Settings → Encoder** and copy the OBS URL. Paste it in OBS Server (Stream Key empty). From another PC the URL uses the kit LAN IP, not `127.0.0.1`.
 
 ---
 
