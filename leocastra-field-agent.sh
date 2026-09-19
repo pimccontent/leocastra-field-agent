@@ -15,9 +15,24 @@ if [ ! -s "$UPLINKS_FILE" ]; then
   printf '%s\n' "AUTO" > "$UPLINKS_FILE"
 fi
 
+is_private_ip() {
+  case "$1" in
+    10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+  esac
+  return 1
+}
+
 skip_iface() {
+  # Kit LAN NICs are for OBS only on public/cloud ingest. For private LAN studio
+  # (offline lab), eth/enp must bond so USB cellular is not required.
   case "$1" in
     lo|docker*|br-*|veth*|cni*|flannel*|virbr*) return 0 ;;
+  esac
+  if [ "${ALLOW_LAN_BOND:-0}" = "1" ]; then
+    return 1
+  fi
+  case "$1" in
+    eth*|enp*|eno*|ens*) return 0 ;;
   esac
   return 1
 }
@@ -127,6 +142,41 @@ filter_unroutable() {
       continue
     fi
     printf '%s\n' "$ip" >> "$filtered"
+    # Private LAN studio: probe the ingest host itself (no public internet needed).
+    if [ "${ALLOW_LAN_BOND:-0}" = "1" ] && [ -n "$dest" ]; then
+      if ping -c 1 -W 2 -I "$iface" "$dest" >/dev/null 2>&1 \
+        || ping -c 1 -W 2 -I "$ip" "$dest" >/dev/null 2>&1 \
+        || python3 -c 'import socket, sys
+ip, iface, dest = sys.argv[1], sys.argv[2], sys.argv[3]
+# TCP to studio HTTP (or any open port) proves L3 reachability.
+for port in (80, 3004, 3002, 443):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        bound = False
+        if iface:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), (iface + "\0").encode())
+                bound = True
+            except OSError:
+                bound = False
+        if not bound:
+            sock.bind((ip, 0))
+        sock.settimeout(2)
+        sock.connect((dest, port))
+        raise SystemExit(0)
+    except OSError:
+        pass
+    finally:
+        sock.close()
+raise SystemExit(1)
+' "$ip" "$iface" "$dest"; then
+        echo "Uplink $ip on $iface reaches LAN ingest $dest" >&2
+        printf '%s\n' "$ip" >> "$probed"
+      else
+        echo "Uplink $ip on $iface cannot reach LAN ingest $dest" >&2
+      fi
+      continue
+    fi
     # Isolated LAN routers still advertise a default. If any uplink can reach
     # a public resolver, keep only those; otherwise keep the route-get set.
     # Some USB tethers (Spreadtrum/Android) block ICMP but still carry TCP/UDP.
@@ -177,11 +227,21 @@ raise SystemExit(1)
 resolve_uplinks() {
   if grep -v '^[[:space:]]*#' "$UPLINKS_FILE" | grep -q '^AUTO[[:space:]]*$'; then
     resolved="$CONFIG_DIR/uplinks.resolved"
-    ip -4 -o addr show scope global 2>/dev/null \
-      | awk '$2 !~ /^(lo|docker[0-9]*|br-|veth|cni|flannel|virbr)/ && !seen[$2]++ { print $4 }' \
-      | cut -d/ -f1 \
-      | grep -vE '^(127\.|172\.17\.)' \
-      > "$resolved" || true
+    if [ "${ALLOW_LAN_BOND:-0}" = "1" ]; then
+      # Offline LAN studio: prefer kit Ethernet toward private ingest.
+      ip -4 -o addr show scope global 2>/dev/null \
+        | awk '$2 !~ /^(lo|docker[0-9]*|br-|veth|cni|flannel|virbr)/ && !seen[$2]++ { print $4 }' \
+        | cut -d/ -f1 \
+        | grep -vE '^(127\.|172\.17\.)' \
+        > "$resolved" || true
+    else
+      # Match status-server: never AUTO-bond kit LAN (eth/enp/eno/ens). Keep usb*/enx*.
+      ip -4 -o addr show scope global 2>/dev/null \
+        | awk '$2 !~ /^(lo|docker[0-9]*|br-|veth|cni|flannel|virbr|eth|enp|eno|ens)/ && !seen[$2]++ { print $4 }' \
+        | cut -d/ -f1 \
+        | grep -vE '^(127\.|172\.17\.)' \
+        > "$resolved" || true
+    fi
     if [ ! -s "$resolved" ]; then
       echo "AUTO uplinks requested but no global IPv4 addresses were found." >&2
       return 1
@@ -213,6 +273,9 @@ try:
 except Exception:
     latency = 4000
 timeout = max(60000, min(180000, latency * 8))
+# srtla_send clamps --conn-timeout-ms to 1000..=60000 (see --help). Passing
+# 64000 for an 8000 ms Ghana window is rejected/ignored; keep the 60s floor.
+timeout = min(60000, timeout)
 print("LEOCASTRA_HOST=" + shlex.quote(host))
 print("BONDED_PORT=" + shlex.quote(bonded))
 print("SRT_LISTEN_PORT=" + shlex.quote(listen))
@@ -242,12 +305,17 @@ while true; do
   fi
   UPLINKS_FILE="${CONFIG_DIR}/uplinks"
   export UPLINKS_FILE
+  DEST_IP=""
+  DEST_IP=$(resolve_dest_ip "$LEOCASTRA_HOST" 2>/dev/null || true)
+  ALLOW_LAN_BOND=0
+  if is_private_ip "${DEST_IP:-}" || is_private_ip "${LEOCASTRA_HOST:-}"; then
+    ALLOW_LAN_BOND=1
+  fi
+  export ALLOW_LAN_BOND
   if ! resolve_uplinks; then
     sleep 3
     continue
   fi
-  DEST_IP=""
-  DEST_IP=$(resolve_dest_ip "$LEOCASTRA_HOST" 2>/dev/null || true)
   apply_source_routes "$DEST_IP"
   if ! filter_unroutable "$DEST_IP"; then
     sleep 3

@@ -27,6 +27,22 @@ LOSSY_SKIP_SECONDS = 600
 _PENDING_ADD: dict[str, float] = {}
 _LAST_IFACE: dict[str, str] = {}
 RESTART_FLAG = CONFIG_DIR / "restart.flag"
+# Send-buffer jam after OBS drops: inFlight stays high while encoder is idle.
+# OBS cannot re-handshake to local :4001 until srtla_send is recycled.
+# Threshold must stay well above normal Live recovery (~50–400 inFlight) —
+# firing at 400 mid-session recycled the sender and killed OBS/playback ~28s in.
+JAM_IN_FLIGHT = 1200
+JAM_HOLD_S = 20.0
+JAM_COOLDOWN_S = 120.0
+# After Live→No Feed with a drained buffer, the local SRT listener often still
+# holds the old caller. Recycle the sender **once** so :4001 accepts OBS again.
+# Never loop while still idle — that restart storm is what kept OBS at 0 kbps.
+IDLE_RECYCLE_HOLD_S = 8.0
+_JAM_SINCE: float | None = None
+_LAST_JAM_RESTART = 0.0
+_HAD_ENCODER = False
+_IDLE_SINCE: float | None = None
+_IDLE_RECYCLED_THIS_IDLE = False
 WEB_ROOT = Path(
     os.environ.get(
         "WEB_ROOT",
@@ -109,7 +125,8 @@ def conn_timeout_ms(cfg: dict) -> int:
     # srtla_send: silence past this tears a path and re-registers. An outage
     # the SRT buffer can absorb should resume warm (upstream: >= 2x window).
     # Floor 60s so Ghana 8s NAK recovery cannot look like a dead path.
-    return max(60000, min(180000, latency * 8))
+    # CLI max is 60000 — never report/pass a higher value.
+    return min(60000, max(60000, min(180000, latency * 8)))
 
 
 def srt_loss_max_ttl(latency_ms: int) -> int:
@@ -171,7 +188,10 @@ def iface_kind(name: str) -> str:
         return "wifi"
     if n.startswith(("wwan", "usb", "cdc", "rmnet", "ppp", "qmi", "mbim")):
         return "cellular"
-    if n.startswith(("eth", "en", "ens", "enp", "eno")):
+    # enx* is often a USB ethernet gadget / modem — not kit LAN.
+    if n.startswith("enx"):
+        return "other"
+    if n.startswith(("eth", "enp", "eno", "ens")):
         return "ethernet"
     return "other"
 
@@ -634,10 +654,12 @@ def auto_candidate_ips() -> list[str]:
     """One global IPv4 per real iface — same AUTO rule as the bond sender.
 
     Cellular/Wi-Fi first so a LAN NIC that cannot reach the internet does not
-    stall the watchdog (each failed ping is a 2s wait).
+    stall the watchdog (each failed ping is a 2s wait). Offline LAN studio:
+    prefer Ethernet toward private ingest.
     """
     seen_iface: set[str] = set()
     ranked: list[tuple[int, str]] = []
+    lan_lab = studio_host_is_private()
     for row in list_networks():
         iface = str(row.get("iface") or "")
         addr = str(row.get("address") or "").strip()
@@ -645,9 +667,14 @@ def auto_candidate_ips() -> list[str]:
             continue
         if is_hidden_bond_address(addr, iface):
             continue
-        seen_iface.add(iface)
         kind = str(row.get("kind") or "other")
-        rank = 0 if kind in ("cellular", "wifi") else 1
+        if not lan_lab and kind == "ethernet":
+            continue
+        seen_iface.add(iface)
+        if lan_lab:
+            rank = 0 if kind == "ethernet" else 1
+        else:
+            rank = 0 if kind in ("cellular", "wifi") else 1
         ranked.append((rank, addr))
     ranked.sort(key=lambda item: item[0])
     return [addr for _, addr in ranked]
@@ -924,8 +951,160 @@ def reconcile_source_routes(desired: list[str]) -> None:
         ensure_source_route(ip)
 
 
+def _ip_int(ip: str) -> int | None:
+    parts = str(ip or "").split(".")
+    if len(parts) != 4:
+        return None
+    try:
+        return (
+            (int(parts[0]) << 24)
+            | (int(parts[1]) << 16)
+            | (int(parts[2]) << 8)
+            | int(parts[3])
+        )
+    except ValueError:
+        return None
+
+
+def is_private_ip(ip: str) -> bool:
+    parts = str(ip or "").split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        a, b = int(parts[0]), int(parts[1])
+    except ValueError:
+        return False
+    if a == 10:
+        return True
+    if a == 192 and b == 168:
+        return True
+    if a == 172 and 16 <= b <= 31:
+        return True
+    return False
+
+
+def studio_host_is_private() -> bool:
+    """Offline lab: bond kit Ethernet when studio is on RFC1918 LAN."""
+    cfg = load_config()
+    host = str(cfg.get("leocastraHost") or "").strip()
+    if is_private_ip(host):
+        return True
+    try:
+        import socket
+
+        return is_private_ip(socket.gethostbyname(host))
+    except OSError:
+        return False
+
+
 def is_bondable_ip(ip: str, networks: list[dict]) -> bool:
-    return bool(ip) and kind_for_ip(ip, networks) != "ethernet"
+    """Ethernet is LAN for OBS — never a bonded uplink on public/cloud ingest.
+
+    Offline lab exception: when leocastraHost is private (LAN studio), kit
+    Ethernet is the correct bond path.
+
+    Also reject non-ethernet addresses on the same /24 as kit Ethernet.
+    Phone USB tethers often DHCP onto 192.168.0.x beside the kit LAN NIC;
+    bonding that path is not operator diversity and spikes RTT past the window.
+    """
+    if not ip:
+        return False
+    kind = kind_for_ip(ip, networks)
+    lan_lab = studio_host_is_private()
+    if kind == "ethernet":
+        return lan_lab
+    candidate = _ip_int(ip)
+    if candidate is None:
+        return False
+    for net in networks:
+        if str(net.get("kind") or "") != "ethernet":
+            continue
+        lan = _ip_int(str(net.get("address") or ""))
+        if lan is not None and (candidate & ~0xFF) == (lan & ~0xFF):
+            return False
+    return True
+
+
+def _request_sender_recycle(reason: str) -> bool:
+    try:
+        RESTART_FLAG.write_text(f"{reason}\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"Bond {reason}: could not write restart.flag: {exc}", flush=True)
+        return False
+    return True
+
+
+def maybe_clear_sender_jam(snap: dict, now: float) -> None:
+    """Recycle srtla_send when OBS cannot re-handshake to local :4001.
+
+    Two cases (never while encoder is receiving — not SST fail-open):
+    1. Jam: encoder idle + high inFlight (buffer wedged after NAK storm)
+    2. Idle: had Live, now No Feed with bond still up — recycle **once**
+       per idle stretch so :4001 accepts OBS. Do not loop every cooldown;
+       that restart storm keeps OBS at 0 and kills playback.
+    """
+    global _JAM_SINCE, _LAST_JAM_RESTART, _HAD_ENCODER, _IDLE_SINCE
+    global _IDLE_RECYCLED_THIS_IDLE
+    enc = snap.get("encoder") or {}
+    path = snap.get("path") or {}
+    bond = snap.get("bond") or {}
+    in_flight = int(path.get("inFlight") or 0)
+    receiving = bool(enc.get("receiving"))
+    active = int(bond.get("active") or 0)
+
+    if receiving:
+        _HAD_ENCODER = True
+        _JAM_SINCE = None
+        _IDLE_SINCE = None
+        _IDLE_RECYCLED_THIS_IDLE = False
+        return
+
+    # 1) High in-flight jam — only a real wedge (was 1.6k–3k in the field),
+    # never normal NAK recovery that briefly parks bitrate under 8 kbps.
+    if in_flight >= JAM_IN_FLIGHT:
+        _IDLE_SINCE = None
+        if _JAM_SINCE is None:
+            _JAM_SINCE = now
+            return
+        if now - _JAM_SINCE < JAM_HOLD_S:
+            return
+        if now - _LAST_JAM_RESTART < JAM_COOLDOWN_S:
+            return
+        if not _request_sender_recycle("jam-clear"):
+            return
+        _LAST_JAM_RESTART = now
+        _JAM_SINCE = None
+        _IDLE_RECYCLED_THIS_IDLE = True
+        print(
+            f"Bond jam-clear: encoder idle with inFlight={in_flight}; "
+            "recycling sender so OBS can re-handshake",
+            flush=True,
+        )
+        return
+
+    _JAM_SINCE = None
+
+    # 2) Live→No Feed with drained buffer: free the local SRT listener once
+    if not _HAD_ENCODER or active < 1:
+        _IDLE_SINCE = None
+        return
+    if _IDLE_RECYCLED_THIS_IDLE:
+        return
+    if _IDLE_SINCE is None:
+        _IDLE_SINCE = now
+        return
+    if now - _IDLE_SINCE < IDLE_RECYCLE_HOLD_S:
+        return
+    if not _request_sender_recycle("idle-listener-clear"):
+        return
+    _IDLE_RECYCLED_THIS_IDLE = True
+    _IDLE_SINCE = None
+    _LAST_JAM_RESTART = now
+    print(
+        "Bond idle-listener-clear: encoder was Live, now idle with bond up; "
+        "recycling sender once so OBS can re-handshake on :4001",
+        flush=True,
+    )
 
 
 def stable_bind_ips(
@@ -1137,6 +1316,7 @@ def watchdog_loop() -> None:
             cfg = load_config()
             now = time.time()
             snap = snapshot()
+            maybe_clear_sender_jam(snap, now)
             if now - last_path_post >= 4:
                 post_path_stats_bg(snap)
                 last_path_post = now
