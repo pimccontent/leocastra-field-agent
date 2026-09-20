@@ -9,3 +9,4 @@ __pycache__/
 *.pid
 .DS_Store
 Thumbs.db
+_*.py
