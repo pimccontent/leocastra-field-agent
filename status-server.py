@@ -24,6 +24,16 @@ UPLINKS_PATH = Path(os.environ.get("UPLINKS_FILE", str(CONFIG_DIR / "uplinks")))
 SKIP_PATH = CONFIG_DIR / "uplinks.skip"
 SKIP_SECONDS = 180
 LOSSY_SKIP_SECONDS = 600
+# Per-path wedge: only quarantine a *dead* path (high inFlight + near-zero
+# bitrate) while another path still carries Live. Do NOT recycle for mere
+# congestion/RTT spikes — that forced single-USB and made unplug tests look
+# like the whole agent died. Skip TTL is short so a recovered modem can rejoin.
+WEDGE_IN_FLIGHT = 900
+WEDGE_BITRATE_MAX = 25
+WEDGE_PEER_BITRATE_MIN = 200
+WEDGE_HOLD_S = 20.0
+WEDGE_SKIP_SECONDS = 300
+_WEDGE_SINCE: dict[str, float] = {}
 _PENDING_ADD: dict[str, float] = {}
 _LAST_IFACE: dict[str, str] = {}
 RESTART_FLAG = CONFIG_DIR / "restart.flag"
@@ -660,10 +670,13 @@ def auto_candidate_ips() -> list[str]:
     seen_iface: set[str] = set()
     ranked: list[tuple[int, str]] = []
     lan_lab = studio_host_is_private()
+    skipped = skip_ip_set()
     for row in list_networks():
         iface = str(row.get("iface") or "")
         addr = str(row.get("address") or "").strip()
         if not addr or iface in seen_iface:
+            continue
+        if addr in skipped:
             continue
         if is_hidden_bond_address(addr, iface):
             continue
@@ -678,6 +691,61 @@ def auto_candidate_ips() -> list[str]:
         ranked.append((rank, addr))
     ranked.sort(key=lambda item: item[0])
     return [addr for _, addr in ranked]
+
+
+def maybe_skip_wedged_paths(snap: dict, now: float) -> None:
+    """Quarantine a dead bonded path; keep the sender on remaining uplinks.
+
+    Only fires when another uplink is already carrying Live. Never skips the
+    last cellular/Wi-Fi path (that would bounce the whole agent to 0/0).
+    Congestion alone is left to quality scoring — full sender recycle on RTT
+    spikes was why a second modem stayed Down / disappeared after unplug tests.
+    """
+    global _WEDGE_SINCE
+    enc = snap.get("encoder") or {}
+    if not enc.get("receiving"):
+        _WEDGE_SINCE.clear()
+        return
+    links = [x for x in (snap.get("links") or []) if x.get("up") and x.get("ip")]
+    if len(links) < 2:
+        _WEDGE_SINCE.clear()
+        return
+    skipped = skip_ip_set()
+    survivors = [
+        str(x.get("ip") or "")
+        for x in links
+        if str(x.get("ip") or "") and str(x.get("ip") or "") not in skipped
+    ]
+    for link in links:
+        ip = str(link.get("ip") or "").strip()
+        if not ip or ip in skipped:
+            continue
+        # Never quarantine if this is the only remaining non-skipped path.
+        if len([s for s in survivors if s != ip]) < 1:
+            _WEDGE_SINCE.pop(ip, None)
+            continue
+        inflight = int(link.get("inFlight") or 0)
+        kbps = int(link.get("bitrateKbps") or 0)
+        peers = [x for x in links if str(x.get("ip") or "") != ip]
+        peer_ok = any(
+            int(x.get("bitrateKbps") or 0) >= WEDGE_PEER_BITRATE_MIN for x in peers
+        )
+        dead = inflight >= WEDGE_IN_FLIGHT and kbps <= WEDGE_BITRATE_MAX and peer_ok
+        if not dead:
+            _WEDGE_SINCE.pop(ip, None)
+            continue
+        since = _WEDGE_SINCE.setdefault(ip, now)
+        if now - since < WEDGE_HOLD_S:
+            continue
+        remember_skip(
+            ip,
+            WEDGE_SKIP_SECONDS,
+            reason=f"wedged inFlight={inflight} kbps={kbps}",
+        )
+        _WEDGE_SINCE.pop(ip, None)
+        # Rebuild bind list without this IP (SIGHUP cannot drop a slot).
+        _request_sender_recycle("wedge-path-skip")
+        return
 
 
 def iface_for_ip(ip: str) -> str:
@@ -914,25 +982,183 @@ def drop_policy_for_ip(ip: str) -> None:
             break
 
 
+def _iface_routes(iface: str) -> list[str]:
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "route", "show", "dev", iface],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def isolate_usb_lan_overlap(iface: str, ip: str) -> None:
+    """USB modems often DHCP 192.168.0.0/24 — same prefix as kit Ethernet.
+
+    That is normal (private link to the modem), not a 'local-only' path. The
+    modem NATs to cellular. Isolate ARP/metrics so office-LAN 192.168.0.1 and
+    modem 192.168.0.1 do not steal each other's traffic.
+    """
+    if not iface.startswith(("usb", "enx", "wwan", "cdc")):
+        return
+    networks = list_networks()
+    cand = _ip_int(ip)
+    if cand is None:
+        return
+    eth_ifaces: list[tuple[str, str]] = []
+    for net in networks:
+        if str(net.get("kind") or "") != "ethernet":
+            continue
+        eip = str(net.get("address") or "")
+        eif = str(net.get("iface") or "")
+        lan = _ip_int(eip)
+        if not eif or lan is None:
+            continue
+        if (cand & ~0xFF) == (lan & ~0xFF):
+            eth_ifaces.append((eif, eip))
+    if not eth_ifaces:
+        return
+    set_rp_filter_loose(iface)
+    try:
+        subprocess.run(
+            ["sysctl", "-w", f"net.ipv4.conf.{iface}.arp_filter=1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    for eif, _eip in eth_ifaces:
+        set_rp_filter_loose(eif)
+        try:
+            subprocess.run(
+                ["sysctl", "-w", f"net.ipv4.conf.{eif}.arp_filter=1"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    # Prefer kit Ethernet for the shared /24; deprioritize USB copy on main.
+    prefix = f"{(cand >> 24) & 0xFF}.{(cand >> 16) & 0xFF}.{(cand >> 8) & 0xFF}.0/24"
+    for eif, eip in eth_ifaces:
+        _ip(
+            "route",
+            "replace",
+            prefix,
+            "dev",
+            eif,
+            "proto",
+            "kernel",
+            "scope",
+            "link",
+            "src",
+            eip,
+            "metric",
+            "50",
+        )
+    _ip(
+        "route",
+        "replace",
+        prefix,
+        "dev",
+        iface,
+        "proto",
+        "kernel",
+        "scope",
+        "link",
+        "src",
+        ip,
+        "metric",
+        "700",
+    )
+    gw = gateway_for_iface(iface)
+    if gw:
+        # Main-table modem default must lose to eth/cellular defaults.
+        _ip(
+            "route",
+            "replace",
+            "default",
+            "via",
+            gw,
+            "dev",
+            iface,
+            "proto",
+            "dhcp",
+            "src",
+            ip,
+            "metric",
+            "700",
+        )
+        _ip("route", "replace", f"{gw}/32", "dev", iface, "metric", "700")
+        for eif, eip in eth_ifaces:
+            egw = gateway_for_iface(eif)
+            if egw == gw:
+                _ip(
+                    "route",
+                    "replace",
+                    f"{egw}/32",
+                    "dev",
+                    eif,
+                    "metric",
+                    "50",
+                )
+
+
 def ensure_source_route(ip: str) -> None:
     """Add a from-IP policy route so a newly plugged tether is not sent via another NIC."""
     iface = iface_for_ip(ip)
     if not iface:
         return
-    rules = list_policy_rules()
-    if any(from_ip == ip for from_ip, _ in rules):
-        set_rp_filter_loose(iface)
-        return
-    used = {table for _, table in rules}
-    table = next((n for n in POLICY_TABLES if n not in used), 119)
-    gw = gateway_for_iface(iface)
+    isolate_usb_lan_overlap(iface, ip)
     set_rp_filter_loose(iface)
+    rules = list_policy_rules()
+    used = {table for _, table in rules}
+    existing = next((t for from_ip, t in rules if from_ip == ip), None)
+    table = existing if existing is not None else next(
+        (n for n in POLICY_TABLES if n not in used), 119
+    )
+    gw = gateway_for_iface(iface)
     try:
+        _ip("route", "flush", "table", str(table))
+        for line in _iface_routes(iface):
+            # Rebuild each iface route into the policy table (dev already implied).
+            parts = line.split()
+            if not parts:
+                continue
+            args = ["route", "replace", *parts, "table", str(table)]
+            # lines already contain "dev iface" sometimes — ip route show dev X omits dev
+            if "dev" not in parts:
+                args = ["route", "replace", *parts, "dev", iface, "table", str(table)]
+            _ip(*args)
         if gw:
-            _ip("route", "replace", "default", "via", gw, "dev", iface, "table", str(table))
+            _ip(
+                "route",
+                "replace",
+                "default",
+                "via",
+                gw,
+                "dev",
+                iface,
+                "table",
+                str(table),
+            )
+            _ip(
+                "route",
+                "replace",
+                f"{gw}/32",
+                "dev",
+                iface,
+                "table",
+                str(table),
+            )
         else:
             _ip("route", "replace", "default", "dev", iface, "table", str(table))
-        _ip("rule", "add", "from", ip, "lookup", str(table), "pref", str(table))
+        if existing is None:
+            _ip("rule", "add", "from", ip, "lookup", str(table), "pref", str(table))
     except OSError:
         pass
 
@@ -1003,25 +1229,15 @@ def is_bondable_ip(ip: str, networks: list[dict]) -> bool:
     Offline lab exception: when leocastraHost is private (LAN studio), kit
     Ethernet is the correct bond path.
 
-    Also reject non-ethernet addresses on the same /24 as kit Ethernet.
-    Phone USB tethers often DHCP onto 192.168.0.x beside the kit LAN NIC;
-    bonding that path is not operator diversity and spikes RTT past the window.
+    USB modems/phones almost always DHCP a private 192.168.x.x (or 10.x) on
+    the USB link and NAT to cellular — that private address is still a valid
+    bond path. Overlap with kit Ethernet is handled by isolate_usb_lan_overlap.
     """
     if not ip:
         return False
     kind = kind_for_ip(ip, networks)
-    lan_lab = studio_host_is_private()
     if kind == "ethernet":
-        return lan_lab
-    candidate = _ip_int(ip)
-    if candidate is None:
-        return False
-    for net in networks:
-        if str(net.get("kind") or "") != "ethernet":
-            continue
-        lan = _ip_int(str(net.get("address") or ""))
-        if lan is not None and (candidate & ~0xFF) == (lan & ~0xFF):
-            return False
+        return studio_host_is_private()
     return True
 
 
@@ -1139,6 +1355,10 @@ def stable_bind_ips(
             continue
         if ip in live and is_bondable_ip(ip, networks):
             append(ip)
+            continue
+        # Never keep LAN-conflict / non-bondable IPs (e.g. phone on 192.168.0.0/24
+        # next to kit Ethernet). keep_stale is only for vanished real uplinks.
+        if ip in live and not is_bondable_ip(ip, networks):
             continue
         if keep_stale:
             append(ip)
@@ -1317,6 +1537,7 @@ def watchdog_loop() -> None:
             now = time.time()
             snap = snapshot()
             maybe_clear_sender_jam(snap, now)
+            maybe_skip_wedged_paths(snap, now)
             if now - last_path_post >= 4:
                 post_path_stats_bg(snap)
                 last_path_post = now
@@ -1347,7 +1568,9 @@ def watchdog_loop() -> None:
                     gone_since.pop(ip, None)
 
             live_uplinks = [
-                ip for ip in current if ip in live and is_bondable_ip(ip, networks)
+                ip
+                for ip in current
+                if ip in live and is_bondable_ip(ip, networks) and ip not in skip_ip_set()
             ]
             swaps: dict[str, str] = {}
             for ip in current:
@@ -1426,14 +1649,27 @@ def watchdog_loop() -> None:
             dropped = [ip for ip in current if ip not in desired]
             joined = [ip for ip in desired if ip not in current]
             add_only = bool(joined) and not dropped
+            # Also reload when dropping LAN-conflict / non-bondable IPs that
+            # cannot complete SRTLA REG2 (e.g. phone DHCP on kit 192.168.0.0/24).
+            drop_only = bool(dropped) and not joined and bool(live_uplinks)
             last_path = not live_uplinks
             # Same-IP replug: leave the file and sockets alone. srtla_send
             # reconnects that conn with REG2. A SIGHUP here is what froze MCR
             # when usb0 reappeared on the Uplinks list.
             need_reload = bool(desired) and (
-                (desired != current and (add_only or last_path))
+                (desired != current and (add_only or drop_only or last_path))
                 or (bool(retry_miss) and last_path)
             )
+            if desired != current and dropped and not need_reload and live_uplinks:
+                # SIGHUP cannot drop a BIND slot — recycle once so REG2 spam stops.
+                write_routable([ip for ip in desired if ip])
+                if _request_sender_recycle("drop-non-bondable"):
+                    print(
+                        "Bond recycle to drop non-bondable: "
+                        f"{' '.join(dropped)} -> {' '.join(desired)}",
+                        flush=True,
+                    )
+                    continue
             if (
                 need_reload
                 and now - last_sighup >= SIGHUP_COOLDOWN_S

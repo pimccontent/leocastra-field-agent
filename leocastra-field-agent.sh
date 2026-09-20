@@ -99,6 +99,62 @@ apply_source_routes() {
       continue
     fi
     sysctl -w "net.ipv4.conf.${iface}.rp_filter=2" >/dev/null 2>&1 || true
+    # USB modem DHCP often shares 192.168.0.0/24 with kit Ethernet — isolate ARP.
+    case "$iface" in
+      usb*|enx*|wwan*|cdc*)
+        sysctl -w "net.ipv4.conf.${iface}.arp_filter=1" >/dev/null 2>&1 || true
+        eth_same=$(python3 - "$ip" <<'PY'
+import subprocess, sys
+ip = sys.argv[1]
+parts = ip.split(".")
+if len(parts) != 4:
+    raise SystemExit(0)
+try:
+    cand = tuple(int(x) for x in parts)
+except ValueError:
+    raise SystemExit(0)
+out = subprocess.check_output(
+    ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+    text=True,
+    errors="replace",
+)
+for line in out.splitlines():
+    cols = line.split()
+    if len(cols) < 4:
+        continue
+    name = cols[1]
+    if not name.startswith(("eth", "enp", "eno", "ens")):
+        continue
+    addr = cols[3].split("/")[0].split(".")
+    if len(addr) != 4:
+        continue
+    try:
+        lan = tuple(int(x) for x in addr)
+    except ValueError:
+        continue
+    if cand[:3] == lan[:3]:
+        print(name)
+        raise SystemExit(0)
+raise SystemExit(0)
+PY
+)
+        if [ -n "$eth_same" ]; then
+          sysctl -w "net.ipv4.conf.${eth_same}.arp_filter=1" >/dev/null 2>&1 || true
+          prefix=$(printf '%s.%s.%s.0/24' "$(echo "$ip" | cut -d. -f1-3)")
+          eth_ip=$(ip -4 -o addr show dev "$eth_same" scope global | awk '{print $4}' | head -1 | cut -d/ -f1)
+          if [ -n "$eth_ip" ]; then
+            ip route replace "$prefix" dev "$eth_same" proto kernel scope link src "$eth_ip" metric 50 2>/dev/null || true
+          fi
+          ip route replace "$prefix" dev "$iface" proto kernel scope link src "$ip" metric 700 2>/dev/null || true
+          gw_usb=$(gateway_for_iface "$iface" "$dest")
+          if [ -n "$gw_usb" ]; then
+            ip route replace default via "$gw_usb" dev "$iface" proto dhcp src "$ip" metric 700 2>/dev/null || true
+            ip route replace "$gw_usb/32" dev "$iface" metric 700 2>/dev/null || true
+          fi
+          echo "Isolated USB $ip on $iface from kit LAN $eth_same ($prefix)" >&2
+        fi
+        ;;
+    esac
     gw=$(gateway_for_iface "$iface" "$dest")
     ip route flush table "$table" 2>/dev/null || true
     ip -4 route show dev "$iface" 2>/dev/null | while read -r line; do
@@ -108,6 +164,7 @@ apply_source_routes() {
     if [ -n "$gw" ]; then
       ip route replace default via "$gw" dev "$iface" table "$table" 2>/dev/null \
         || ip route replace default dev "$iface" table "$table" 2>/dev/null || true
+      ip route replace "$gw/32" dev "$iface" table "$table" 2>/dev/null || true
       echo "Source route $ip -> $dest via $gw dev $iface table $table" >&2
     else
       ip route replace default dev "$iface" table "$table" 2>/dev/null || true
