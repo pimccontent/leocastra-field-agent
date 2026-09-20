@@ -107,6 +107,22 @@ def env_defaults() -> dict:
         "schedulerMode": os.environ.get("SRTLA_MODE", "enhanced") or "enhanced",
         "latencyMs": int(os.environ.get("LATENCY_MS", "8000") or 8000),
         "qualityScoring": True,
+        # Optional secrets — empty means open kit UI / unsigned path-stats (compat).
+        "uiToken": "",
+        "pathStatsToken": "",
+    }
+
+
+def _disk_secrets() -> dict[str, str]:
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        "uiToken": str(raw.get("uiToken") or "").strip(),
+        "pathStatsToken": str(raw.get("pathStatsToken") or "").strip(),
     }
 
 
@@ -115,7 +131,9 @@ def load_config() -> dict:
     try:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
-            cfg.update({k: raw[k] for k in raw if k in cfg or k == "uplinkIps"})
+            for k, v in raw.items():
+                if k in cfg or k == "uplinkIps":
+                    cfg[k] = v
     except (OSError, json.JSONDecodeError):
         pass
     if str(cfg.get("uplinkMode", "auto")).lower() != "manual":
@@ -127,8 +145,35 @@ def load_config() -> dict:
     cfg["bondedPort"] = int(cfg.get("bondedPort") or 10180)
     cfg["listenPort"] = int(cfg.get("listenPort") or 4001)
     cfg["latencyMs"] = int(cfg.get("latencyMs") or 4000)
+    # Env wins over disk so compose/.env can enable auth without rewriting JSON.
+    secrets = _disk_secrets()
+    cfg["uiToken"] = (
+        str(os.environ.get("UI_TOKEN") or "").strip() or secrets.get("uiToken") or ""
+    )
+    cfg["pathStatsToken"] = (
+        str(os.environ.get("PATH_STATS_TOKEN") or "").strip()
+        or secrets.get("pathStatsToken")
+        or ""
+    )
     return cfg
 
+
+def public_config() -> dict:
+    """Config for the Web UI — never include UI/path-stats secrets."""
+    cfg = load_config()
+    return {
+        "leocastraHost": cfg.get("leocastraHost") or "",
+        "bondedPort": int(cfg.get("bondedPort") or 10180),
+        "listenPort": int(cfg.get("listenPort") or 4001),
+        "studioUrl": cfg.get("studioUrl") or "",
+        "uplinkMode": cfg.get("uplinkMode") or "auto",
+        "uplinkIps": list(cfg.get("uplinkIps") or []),
+        "schedulerMode": cfg.get("schedulerMode") or "enhanced",
+        "latencyMs": int(cfg.get("latencyMs") or 8000),
+        "qualityScoring": bool(cfg.get("qualityScoring", True)),
+        "uiAuthRequired": bool(str(cfg.get("uiToken") or "").strip()),
+        "pathStatsTokenSet": bool(str(cfg.get("pathStatsToken") or "").strip()),
+    }
 
 def conn_timeout_ms(cfg: dict) -> int:
     latency = max(1500, int(cfg.get("latencyMs") or 4000))
@@ -147,6 +192,7 @@ def srt_loss_max_ttl(latency_ms: int) -> int:
 
 def save_config(cfg: dict) -> dict:
     ensure_dirs()
+    secrets = _disk_secrets()
     cleaned = {
         "leocastraHost": str(cfg.get("leocastraHost") or "").strip(),
         "bondedPort": int(cfg.get("bondedPort") or 0),
@@ -158,6 +204,11 @@ def save_config(cfg: dict) -> dict:
         "latencyMs": int(cfg.get("latencyMs") or 4000),
         "qualityScoring": bool(cfg.get("qualityScoring", True)),
     }
+    # Preserve disk secrets; Web UI save must never wipe or overwrite tokens.
+    if secrets.get("uiToken"):
+        cleaned["uiToken"] = secrets["uiToken"]
+    if secrets.get("pathStatsToken"):
+        cleaned["pathStatsToken"] = secrets["pathStatsToken"]
     if not cleaned["leocastraHost"]:
         raise ValueError("Ingest host is required")
     if not 1 <= cleaned["bondedPort"] <= 65535:
@@ -173,7 +224,7 @@ def save_config(cfg: dict) -> dict:
         if not cleaned["uplinkIps"]:
             raise ValueError("Manual mode needs at least one source IP")
         UPLINKS_PATH.write_text("\n".join(cleaned["uplinkIps"]) + "\n", encoding="utf-8")
-    return cleaned
+    return public_config()
 
 
 def request_restart(*, clear_skips: bool = False) -> None:
@@ -596,16 +647,40 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("JSON object required")
         return data
 
+    def _ui_token(self) -> str:
+        return str(load_config().get("uiToken") or "").strip()
+
+    def _client_token(self) -> str:
+        auth = str(self.headers.get("Authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return str(self.headers.get("X-LeoCastra-Token") or "").strip()
+
+    def _require_ui_auth(self) -> bool:
+        """When UI_TOKEN is unset, kit stays open (current behavior)."""
+        expected = self._ui_token()
+        if not expected:
+            return True
+        if self._client_token() == expected:
+            return True
+        self._json(401, {"error": "unauthorized", "authRequired": True})
+        return False
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if path == "/api/status":
+            # Status stays open so LAN monitors / health polls keep working.
             self._json(200, snapshot())
             return
         if path == "/api/config":
-            self._json(200, load_config())
+            if not self._require_ui_auth():
+                return
+            self._json(200, public_config())
             return
         if path == "/api/wifi/scan":
+            if not self._require_ui_auth():
+                return
             qs = urllib.parse.parse_qs(parsed.query)
             iface = (qs.get("iface") or [""])[0]
             self._json(200, wifi_scan(iface))
@@ -630,6 +705,8 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path != "/api/config":
             self._json(404, {"error": "not found"})
             return
+        if not self._require_ui_auth():
+            return
         try:
             saved = save_config(self._read_json())
             self._json(200, saved)
@@ -639,6 +716,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/restart":
+            if not self._require_ui_auth():
+                return
             try:
                 request_restart(clear_skips=True)
                 self._json(200, {"ok": True})
@@ -646,6 +725,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"error": str(exc)})
             return
         if parsed.path == "/api/wifi/connect":
+            if not self._require_ui_auth():
+                return
             try:
                 body = self._read_json()
                 wifi_connect(
@@ -1379,6 +1460,7 @@ def _https_post_ipv4(
     body: bytes,
     timeout: float = 5,
     source_ip: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> int:
     """POST JSON over IPv4. Bind to a bonded uplink so studio HTTPS does not
     take the LAN default route (that path times out on this kit)."""
@@ -1398,15 +1480,18 @@ def _https_post_ipv4(
             sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
         conn.sock = sock
+        headers = {
+            "Content-Type": "application/json",
+            "Host": host if port in (80, 443) else f"{host}:{port}",
+            "Content-Length": str(len(body)),
+        }
+        if extra_headers:
+            headers.update(extra_headers)
         conn.request(
             "POST",
             path,
             body=body,
-            headers={
-                "Content-Type": "application/json",
-                "Host": host if port in (80, 443) else f"{host}:{port}",
-                "Content-Length": str(len(body)),
-            },
+            headers=headers,
         )
         resp = conn.getresponse()
         resp.read()
@@ -1485,9 +1570,13 @@ def post_path_stats(snap: dict) -> None:
     candidates: list[str | None] = list(sources)
     candidates.append(None)
     last_error = "no uplink"
+    token = str(cfg.get("pathStatsToken") or "").strip()
+    extra = {"X-LeoCastra-Path-Stats": token} if token else None
     for source_ip in candidates:
         try:
-            status = _https_post_ipv4(url, body, timeout=5, source_ip=source_ip)
+            status = _https_post_ipv4(
+                url, body, timeout=5, source_ip=source_ip, extra_headers=extra
+            )
             if status >= 400:
                 last_error = f"HTTP {status} via {source_ip or 'default'}"
                 continue

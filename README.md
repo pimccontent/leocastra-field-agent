@@ -80,11 +80,11 @@ Then open `http://localhost:8088`.
 
 | Kind | Role |
 |------|------|
-| Ethernet | Wired uplink |
-| Wi-Fi | Normal bonded uplink on a Linux kit |
-| Cellular | USB LTE / modem address |
+| Ethernet | Kit LAN for OBS/vMix (not a public uplink on cloud ingest) |
+| Wi-Fi | Bonded uplink on a Linux kit |
+| Cellular | USB LTE / modem address (private 192.168.x is normal) |
 
-Auto mode bonds every global IPv4 on real NICs (Ethernet, Wi-Fi, USB LTE). Docker bridge addresses are ignored. `ping` on `usb0` only proves ICMP; the bond is UDP to the ingest host and bonded port. On Linux the kit installs source routes so each uplink IP leaves through its own interface. Without that, cellular and Ethernet share the default route and SRTLA registration fails even when ping works.
+Auto mode bonds Wi‑Fi and cellular USB addresses toward a **public** ingest. Kit Ethernet stays for the local encoder unless the studio host is on a private LAN (offline lab). Docker bridge addresses are ignored. `ping` on `usb0` only proves ICMP; the bond is UDP to the ingest host and bonded port. On Linux the kit installs source routes so each uplink IP leaves through its own interface. Without that, cellular and Ethernet share the default route and SRTLA registration fails even when ping works.
 
 The bond is **UDP** to the ingest host. An HTTPS reverse proxy or CDN in front of the studio website cannot carry this path. The ingest hostname must resolve to the machine that accepts the bonded UDP port, and that port must be open on the firewall.
 

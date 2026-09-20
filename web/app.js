@@ -96,8 +96,23 @@ function sleep(ms) {
 }
 
 async function api(path, options) {
-  const r = await fetch(path, { cache: "no-store", ...options });
+  const opts = { cache: "no-store", ...options };
+  const headers = new Headers(opts.headers || {});
+  const token = sessionStorage.getItem("leocastraUiToken") || "";
+  if (token && !headers.has("Authorization")) {
+    headers.set("Authorization", "Bearer " + token);
+  }
+  opts.headers = headers;
+  const r = await fetch(path, opts);
   const data = await r.json().catch(() => ({}));
+  if (r.status === 401 && data && data.authRequired) {
+    const next = window.prompt("This kit requires a UI token (UI_TOKEN). Enter it:");
+    if (next && next.trim()) {
+      sessionStorage.setItem("leocastraUiToken", next.trim());
+      return api(path, options);
+    }
+    throw new Error("UI token required");
+  }
   if (!r.ok) throw new Error(data.error || r.statusText || "Request failed");
   return data;
 }
@@ -285,7 +300,7 @@ function renderSettings(c, nets, status) {
         <div class="field">
           ${label("Uplink mode", "Auto binds every global IPv4. Manual pins specific source IPs.")}
           <select name="uplinkMode" id="uplinkMode">
-            <option value="auto" ${c.uplinkMode === "auto" ? "selected" : ""}>Auto (all interfaces)</option>
+            <option value="auto" ${c.uplinkMode === "auto" ? "selected" : ""}>Auto (cellular + Wi-Fi)</option>
             <option value="manual" ${c.uplinkMode === "manual" ? "selected" : ""}>Manual IPs</option>
           </select>
         </div>
@@ -342,7 +357,7 @@ function renderHelp() {
   return `
     <section class="help-hero card">
       <h2>Field contribution kit</h2>
-      <p>Encoder sends SRT here. This kit bonds Ethernet, Wi-Fi, and cellular, then forwards one low-latency path to studio ingest. Studio pulls as an SRT caller. The kit does not transcode.</p>
+      <p>Encoder sends SRT here. This kit bonds cellular and Wi-Fi uplinks (Ethernet is for OBS on the LAN), then forwards one low-latency path to studio ingest. Studio pulls as an SRT caller. The kit does not transcode.</p>
     </section>
     <div class="help-grid">
       <article class="help-card card">
@@ -389,7 +404,7 @@ function renderHelp() {
     </section>
     <section class="help-block card section">
       <h3>Wi-Fi and bonding</h3>
-      <p class="muted">On Ubuntu Server with host networking, <code>wlan0</code> is an uplink the same way Ethernet or LTE is. Auto mode includes it when it has an IPv4 address. Connect SSID from Settings, then Save if you pin IPs manually. Two SIMs must be different radio cores.</p>
+      <p class="muted">On Ubuntu Server with host networking, <code>wlan0</code> is an uplink the same way USB LTE is. Auto mode includes Wi-Fi/cellular when they have an IPv4 address (kit Ethernet stays LAN for OBS on public ingest). Connect SSID from Settings, then Save if you pin IPs manually. Two SIMs must be different radio cores.</p>
     </section>
   `;
 }

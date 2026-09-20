@@ -281,15 +281,36 @@ The installer only adds those rules when `ufw` is already active. It does not en
 
 ## 11. Update the kit after a code fix
 
+Preferred (preserves `./data` config and uplinks):
+
+```bash
+cd /opt/leocastra-field-agent
+sudo ./update.sh
+```
+
+Manual equivalent:
+
 ```bash
 cd /opt/leocastra-field-agent
 sudo git fetch origin
 sudo git checkout main
-sudo git pull
+sudo git pull --ff-only
 sudo docker compose -f docker-compose.yml -f docker-compose.kit.yml up -d --build
 ```
 
 Script/UI-only changes reuse the cached `srtla_send` compile. Changing the Dockerfile Rust stage rebuilds it.
+
+### Optional kit UI token (does not change bonding)
+
+Leave unset for open LAN UI (default). To require a token for Settings / Restart / Wi‑Fi:
+
+```bash
+# in /opt/leocastra-field-agent/.env
+UI_TOKEN=long-random-string
+sudo docker compose -f docker-compose.yml -f docker-compose.kit.yml up -d
+```
+
+`/api/status` stays open for monitoring. The Web UI prompts once and stores the token in sessionStorage.
 
 ---
 
