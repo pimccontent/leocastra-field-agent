@@ -18,6 +18,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from bond_policy import path_is_wedged_dead, slash24_equal, uplink_kind_is_bondable
+
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/var/lib/leocastra"))
 CONFIG_PATH = CONFIG_DIR / "config.json"
 UPLINKS_PATH = Path(os.environ.get("UPLINKS_FILE", str(CONFIG_DIR / "uplinks")))
@@ -811,7 +813,13 @@ def maybe_skip_wedged_paths(snap: dict, now: float) -> None:
         peer_ok = any(
             int(x.get("bitrateKbps") or 0) >= WEDGE_PEER_BITRATE_MIN for x in peers
         )
-        dead = inflight >= WEDGE_IN_FLIGHT and kbps <= WEDGE_BITRATE_MAX and peer_ok
+        dead = path_is_wedged_dead(
+            inflight=inflight,
+            kbps=kbps,
+            peer_ok=peer_ok,
+            inflight_min=WEDGE_IN_FLIGHT,
+            kbps_max=WEDGE_BITRATE_MAX,
+        )
         if not dead:
             _WEDGE_SINCE.pop(ip, None)
             continue
@@ -1102,6 +1110,9 @@ def isolate_usb_lan_overlap(iface: str, ip: str) -> None:
             eth_ifaces.append((eif, eip))
     if not eth_ifaces:
         return
+    # Defensive: only isolate when slash24 really overlaps (same rule as tests).
+    if not any(slash24_equal(ip, eip) for _eif, eip in eth_ifaces):
+        return
     set_rp_filter_loose(iface)
     try:
         subprocess.run(
@@ -1317,9 +1328,7 @@ def is_bondable_ip(ip: str, networks: list[dict]) -> bool:
     if not ip:
         return False
     kind = kind_for_ip(ip, networks)
-    if kind == "ethernet":
-        return studio_host_is_private()
-    return True
+    return uplink_kind_is_bondable(kind, lan_lab=studio_host_is_private())
 
 
 def _request_sender_recycle(reason: str) -> bool:

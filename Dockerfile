@@ -21,10 +21,11 @@ RUN apt-get update \
 COPY --from=build /src/target/release/srtla_send /usr/local/bin/srtla_send
 COPY leocastra-field-agent.sh /usr/local/bin/leocastra-field-agent.sh
 COPY status-server.py /usr/local/lib/leocastra-field-agent-status.py
+COPY bond_policy.py /usr/local/lib/bond_policy.py
 COPY web /usr/local/share/leocastra-field-agent/web
 RUN sed -i 's/\r$//' /usr/local/bin/leocastra-field-agent.sh /usr/local/lib/leocastra-field-agent-status.py \
   && chmod +x /usr/local/bin/leocastra-field-agent.sh /usr/local/bin/srtla_send \
-  && chmod 644 /usr/local/lib/leocastra-field-agent-status.py \
+  && chmod 644 /usr/local/lib/leocastra-field-agent-status.py /usr/local/lib/bond_policy.py \
     && mkdir -p /var/lib/leocastra /etc/leocastra
 ENV SRT_LISTEN_PORT=4001 \
     CONFIG_DIR=/var/lib/leocastra \
@@ -32,5 +33,6 @@ ENV SRT_LISTEN_PORT=4001 \
     SRTLA_SEND_BIN=/usr/local/bin/srtla_send \
     STATUS_PORT=8088 \
     METRICS_BIND=127.0.0.1:9099 \
-    WEB_ROOT=/usr/local/share/leocastra-field-agent/web
+    WEB_ROOT=/usr/local/share/leocastra-field-agent/web \
+    PYTHONPATH=/usr/local/lib
 ENTRYPOINT ["/usr/local/bin/leocastra-field-agent.sh"]

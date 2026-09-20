@@ -8,6 +8,7 @@ METRICS_BIND="${METRICS_BIND:-127.0.0.1:9099}"
 STATUS_PORT="${STATUS_PORT:-8088}"
 STATUS_SERVER="${STATUS_SERVER:-/usr/local/lib/leocastra-field-agent-status.py}"
 export CONFIG_DIR UPLINKS_FILE METRICS_BIND STATUS_PORT
+export PYTHONPATH="/usr/local/lib${PYTHONPATH:+:$PYTHONPATH}"
 export RUST_LOG="${RUST_LOG:-info}"
 
 mkdir -p "$CONFIG_DIR" "$(dirname "$UPLINKS_FILE")"
