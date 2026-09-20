@@ -288,6 +288,12 @@ cd /opt/leocastra-field-agent
 sudo ./update.sh
 ```
 
+The kit must be able to reach `github.com:443` for `git pull`. If pull times out (common when only cellular is default), update from a machine that can reach GitHub, or copy files onto the kit over LAN, then rebuild:
+
+```bash
+sudo docker compose -f docker-compose.yml -f docker-compose.kit.yml up -d --build
+```
+
 Manual equivalent:
 
 ```bash
